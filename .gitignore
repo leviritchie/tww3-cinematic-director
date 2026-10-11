@@ -1,0 +1,16 @@
+# Extracted vanilla game scripts (Creative Assembly's, not ours)
+_reference/
+
+# Stale copy of an older project layout
+/cinematic_director/
+
+# Built packs: attach to GitHub releases instead
+*.pack
+
+# Harness output
+tools/harness/cinematic_director_log.txt
+tools/harness/cinematic_director_tactics.txt
+
+__pycache__/
+*.pyc
+.claude/

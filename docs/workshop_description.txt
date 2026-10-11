@@ -1,0 +1,46 @@
+[h1]Cinematic Director[/h1]
+
+Watch your battles like a film, and let your regiments fight them by the plans you gave them in the campaign.
+
+[h2]The cinematic camera[/h2]
+Press the [b]Toggle camera tracking[/b] or [b]Unit camera[/b] key (see Options > Controls for your bindings) during a battle to hand the camera to the director. Press it again, or Esc, to take it back.
+
+[list]
+[*]Cuts between the most interesting things on the field: charges seconds before impact, fresh clashes, volleys landing, spells being cast, monsters and heroes in the thick of it
+[*]Shot types: tracking, over the shoulder, heroic low angle, orbit, chase, wide clash, impact, volley from the shooter's side and the target's side
+[*]Your general is the story's anchor: the camera returns to them between action shots
+[*]Regiments of Renown, lords, heroes, monsters, cavalry and fliers get more screen time
+[*]If nothing is happening around the unit on screen, it cuts to where the fighting is
+[*]When one side breaks, the finale films the rout, the pursuit and a victory orbit around your general
+[/list]
+
+[h2]Cinematic HUD[/h2]
+While the director is filming, the normal battle UI is hidden (the minimap stays) and a small HUD appears:
+[list]
+[*][b]Tide of battle[/b] - a bar across the top showing each side's share of the fighting strength left, and which way it is turning
+[*][b]Caption[/b] - the unit on camera: side, type, what it is doing, men, health, ammo and its current tactic
+[*][b]Battle report[/b] - the latest charges, clashes, volleys, spells, routs and losses
+[/list]
+The [b]HUD[/b] button in the top right cycles: full HUD > letterbox bars > hidden.
+
+[h2]Unit tactics (Unicorn Overlord style)[/h2]
+In the campaign, select an army and click [b]Battle Tactics[/b] above the unit cards. Give each regiment a short list of rules, checked from the top:
+[i]When[/i] (a condition) > [i]target[/i] > [i]do[/i] (an action). For example: "Enemy cavalry within 120 m > Enemy cavalry > Attack", "Self HP below 50% > Fall back to our lord".
+[list]
+[*]More rows unlock as a unit gains rank (lords and heroes by character rank)
+[*]Presets for common roles: line, vanguard, bodyguard, flanker, hammer, skirmisher, sniper, mage, support and more
+[*]Lords and heroes can cast their spells by rule (attack spells, buffs and heals)
+[/list]
+In battle, your regiments carry out their tactics on their own and [b]you can't give orders[/b]: the plan is the plan. Select a unit to see its tactics panel on the right, with the row it's following now highlighted.
+Units with no tactics set (custom battles, reinforcements) use sensible defaults for their role.
+
+[h2]Notes[/h2]
+[list]
+[*][b]Multiplayer:[/b] unit tactics and the tactics editor switch themselves off in multiplayer battles and campaigns. The cinematic camera only moves your own view.
+[*]Safe to add to an existing campaign. Removing it leaves only an unused saved value behind.
+[*]Script-only mod with its own UI templates; it doesn't replace any game files, so it should get along with most other mods.
+[*]Problems? The game folder has [i]cinematic_director_log.txt[/i]. For a detailed log, create an empty file named [i]cinematic_director_debug.txt[/i] in the game folder, play the battle again and include the log in your report.
+[/list]
+
+[h2]Credits[/h2]
+Camera ideas (the general as narrative anchor, the finale, lost-target recovery) were inspired by the Cinematic Battle Camera mod. No code from it is used.

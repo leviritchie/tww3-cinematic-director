@@ -1,0 +1,872 @@
+--------------------------------------------------------------------------------
+-- Cinematic Director  v2
+-- Automatic action camera for Total War: WARHAMMER III battles.
+--
+-- Press the camera Tracking key (Options > Controls, "toggle_tracking") to toggle.
+-- (The Unit Camera / context_camera key is not reported to script, so it can't be used.)
+--
+-- While active the camera picks interesting units/clashes, frames them with a
+-- mix of shot types, follows them and cuts between them. Imminent charges and
+-- fresh contacts between units interrupt the current shot; several collisions
+-- close together get a wider shot covering all of them.
+--
+-- Diagnostic log: cinematic_director_log.txt in the game's install folder.
+--------------------------------------------------------------------------------
+
+local CFG = {
+	toggle_shortcuts = {
+		toggle_tracking = true,
+		context_camera = true,
+	},
+	deselect_on_start = true,	-- clear selection so vanilla tracking/unit camera have nothing to follow
+
+	tick_ms = 100,				-- camera update interval (real time)
+	survey_every = 4,			-- re-scan the battlefield every N ticks
+	move_dur_factor = 1.3,		-- each move_to lasts tick * this, so consecutive moves overlap slightly
+
+	-- smoothing time constants (seconds); larger = floatier, steadier
+	anchor_tau = 0.7,			-- how lazily shot anchors follow unit centroids (kills formation jiggle)
+	cam_pos_tau = 0.45,
+	cam_targ_tau = 0.35,
+	cam_rise_tau = 0.15,		-- faster when terrain forces the camera upward
+	axis_blend = 0.02,			-- per tick; how quickly a shot's reference axis re-aligns
+
+	shot_min = 5,				-- normal shots, seconds
+	shot_max = 9,
+	event_interrupt_after = 1.0,	-- a normal shot can be cut for a contact event after this long
+	event_min_hold = 3.0,		-- an event shot can only be cut by another event after this long
+
+	-- contact detection
+	charge_min_speed = 2.5,		-- m/s
+	charge_min_closing = 2.0,	-- m/s
+	charge_ttc = 3.5,			-- seconds before impact we cut to a charge
+	contact_radius = 14,		-- centroid distance considered "touching"
+	recontact_gap = 15,			-- seconds out of melee before a contact counts as fresh again
+	pair_cooldown = 25,			-- seconds before the same pair can trigger again
+	unit_cooldown = 10,			-- seconds before the same unit can trigger again
+	event_ttl = 2.5,			-- unfilmed events expire after this long
+	cluster_radius = 85,		-- events within this distance are filmed together
+	event_gather = 0.5,			-- wait this long after the first event so simultaneous ones can group up
+	event_urgent_ttc = 1.5,		-- ...unless an impact is this close
+
+	min_ground_clearance = 1.6,
+	log_shortcuts = 40,
+};
+
+local LOG_PATH = "cinematic_director_log.txt";
+
+local function log(s)
+	local ok, f = pcall(io.open, LOG_PATH, "a");
+	if ok and f then
+		local t = "";
+		pcall(function() t = os.date("%H:%M:%S ") end);
+		f:write(t .. tostring(s) .. "\n");
+		f:close();
+	end;
+end;
+
+local cd = {
+	active = false,
+	toggle_lock = false,
+	shortcuts_logged = 0,
+	errors = 0,
+
+	now = 0,			-- seconds of director run time
+	ticks = 0,
+	list = {},			-- latest survey
+	prev = {},			-- key -> {x, z, t}
+	vel = {},			-- key -> {vx, vz}
+	hist = {},			-- key -> {melee, last_melee}
+	pair_seen = {},		-- pairkey -> time
+	unit_seen = {},		-- key -> time
+	events = {},		-- pending contact events
+	recent = {},		-- key -> times filmed
+	shot = nil,
+	cam = nil,			-- smoothed camera state {x,y,z,tx,ty,tz}
+};
+
+--------------------------------------------------------------------------------
+-- helpers
+--------------------------------------------------------------------------------
+
+local function rnd(a, b) return a + math.random() * (b - a) end;
+local function clamp(x, a, b) if x < a then return a elseif x > b then return b end return x end;
+local function chance(p) return math.random() < p end;
+
+local function safe(fn, default)
+	local ok, r = pcall(fn);
+	if ok then return r end;
+	return default;
+end;
+
+local function ground(x, z)
+	local ok, h = pcall(function() return bm:get_terrain_height(x, z) end);
+	if ok and type(h) == "number" then return h end;
+	return 0;
+end;
+
+local function dist2(ax, az, bx, bz)
+	local dx, dz = bx - ax, bz - az;
+	return math.sqrt(dx * dx + dz * dz);
+end;
+
+local function norm2(x, z)
+	local l = math.sqrt(x * x + z * z);
+	if l < 0.0001 then return 0, 1 end;
+	return x / l, z / l;
+end;
+
+-- exponential smoothing factor for a time constant
+local function k(tau) return 1 - math.exp(-(CFG.tick_ms / 1000) / tau) end;
+
+local function upos(u)
+	local p = u:position();
+	return p:get_x(), p:get_y(), p:get_z();
+end;
+
+--------------------------------------------------------------------------------
+-- battlefield survey + contact detection
+--------------------------------------------------------------------------------
+
+local function player_alliance_num()
+	return safe(function() return bm:get_player_alliance_num() end, 1);
+end;
+
+local function is_alive(u)
+	return safe(function() return u:number_of_men_alive() > 0 and not u:is_shattered() end, false);
+end;
+
+local function survey()
+	local list = {};
+	local pa_num = player_alliance_num();
+	local pa = safe(function() return bm:alliances():item(pa_num) end, nil);
+	local alliances = bm:alliances();
+	local now = cd.now;
+
+	for a = 1, alliances:count() do
+		local armies = alliances:item(a):armies();
+		for r = 1, armies:count() do
+			local units = armies:item(r):units();
+			for i = 1, units:count() do
+				local u = units:item(i);
+				if is_alive(u) then
+					local friendly = (a == pa_num);
+					local visible = friendly or safe(function() return u:is_visible_to_alliance(pa) end, true);
+					if visible then
+						local x, y, z = upos(u);
+						local c = {
+							u = u, x = x, y = y, z = z,
+							alliance = a,
+							friendly = friendly,
+							melee = safe(function() return u:is_in_melee() end, false),
+							missile = safe(function() return u:is_under_missile_attack() end, false),
+							fast = safe(function() return u:is_moving_fast() end, false),
+							routing = safe(function() return u:is_routing() end, false),
+							general = safe(function() return u:is_commanding_unit() end, false),
+							flying = safe(function() return u:can_fly() end, false),
+							cavalry = safe(function() return u:is_cavalry() end, false),
+							men = safe(function() return u:initial_number_of_men() end, 100),
+						};
+						c.big = c.men <= 8;	-- monsters, heroes, lords, chariots, war machines
+						c.key = tostring(safe(function() return u:unique_ui_id() end, tostring(u)));
+
+						-- velocity
+						local pv = cd.prev[c.key];
+						local vel = cd.vel[c.key] or { vx = 0, vz = 0 };
+						if pv and now - pv.t > 0.05 then
+							local dt = now - pv.t;
+							vel.vx = vel.vx * 0.4 + 0.6 * (x - pv.x) / dt;
+							vel.vz = vel.vz * 0.4 + 0.6 * (z - pv.z) / dt;
+						end;
+						cd.vel[c.key] = vel;
+						cd.prev[c.key] = { x = x, z = z, t = now };
+						c.vx, c.vz = vel.vx, vel.vz;
+						c.speed = math.sqrt(c.vx * c.vx + c.vz * c.vz);
+
+						list[#list + 1] = c;
+					end;
+				end;
+			end;
+		end;
+	end;
+	return list;
+end;
+
+local function pair_key(a, b)
+	if a.key < b.key then return a.key .. "|" .. b.key end;
+	return b.key .. "|" .. a.key;
+end;
+
+local function nearest_enemy(c, list, max_d)
+	local best, bd = nil, max_d or 1e9;
+	for _, o in ipairs(list) do
+		if o.alliance ~= c.alliance and not o.routing then
+			local d = dist2(c.x, c.z, o.x, o.z);
+			if d < bd then best, bd = o, d end;
+		end;
+	end;
+	return best, bd;
+end;
+
+local function unit_weight(c)
+	local w = 1;
+	if c.general then w = w + 2 end;
+	if c.big then w = w + 1.5 end;
+	if c.cavalry then w = w + 1 end;
+	if c.flying then w = w + 0.5 end;
+	return w;
+end;
+
+local function add_event(kind, a, b, ttc)
+	local pk = pair_key(a, b);
+	local now = cd.now;
+	if cd.pair_seen[pk] and now - cd.pair_seen[pk] < CFG.pair_cooldown then return end;
+	if cd.unit_seen[a.key] and now - cd.unit_seen[a.key] < CFG.unit_cooldown then return end;
+	cd.pair_seen[pk] = now;
+	cd.unit_seen[a.key] = now;
+	cd.unit_seen[b.key] = now;
+
+	local e = {
+		kind = kind, a = a, b = b, t = now, ttc = ttc or 0,
+		x = (a.x + b.x) * 0.5, z = (a.z + b.z) * 0.5,
+		score = 6 + unit_weight(a) + unit_weight(b) + (kind == "charge" and 1.5 or 0),
+	};
+	cd.events[#cd.events + 1] = e;
+	log(string.format("event %-7s ttc=%.1f a(men=%d gen=%s cav=%s) b(men=%d gen=%s)",
+		kind, e.ttc, a.men, tostring(a.general), tostring(a.cavalry), b.men, tostring(b.general)));
+end;
+
+local function detect_events(list)
+	local now = cd.now;
+
+	for _, c in ipairs(list) do
+		local h = cd.hist[c.key];
+		if not h then
+			-- first sight: just record, never fire (avoids a burst of "fresh" contacts on toggle-on)
+			cd.hist[c.key] = { melee = c.melee, last_melee = c.melee and now or -1e9 };
+		else
+			local long_out = (now - h.last_melee) > CFG.recontact_gap;
+
+			-- fresh contact: just entered melee after a long time out of it
+			if c.melee and not h.melee and long_out and not c.routing then
+				local e = nearest_enemy(c, list, 45);
+				if e then add_event("contact", c, e) end;
+			end;
+
+			-- imminent charge: moving fast toward a nearby enemy, about to hit
+			if not c.melee and not c.routing and long_out and c.speed > CFG.charge_min_speed then
+				local best, best_ttc = nil, CFG.charge_ttc;
+				for _, e in ipairs(list) do
+					if e.alliance ~= c.alliance and not e.routing then
+						local d = dist2(c.x, c.z, e.x, e.z);
+						if d < 90 then
+							local dx, dz = norm2(e.x - c.x, e.z - c.z);
+							local closing = (c.vx - e.vx) * dx + (c.vz - e.vz) * dz;
+							if closing > CFG.charge_min_closing then
+								local gap = d - CFG.contact_radius - (c.big and 4 or 0) - (e.big and 4 or 0);
+								local ttc = gap / closing;
+								if ttc > -0.5 and ttc < best_ttc then best, best_ttc = e, ttc end;
+							end;
+						end;
+					end;
+				end;
+				if best then add_event("charge", c, best, math.max(best_ttc, 0)) end;
+			end;
+
+			h.melee = c.melee;
+			if c.melee then h.last_melee = now end;
+		end;
+	end;
+
+	-- expire stale events
+	local keep = {};
+	for _, e in ipairs(cd.events) do
+		if now - e.t < CFG.event_ttl and is_alive(e.a.u) and is_alive(e.b.u) then keep[#keep + 1] = e end;
+	end;
+	cd.events = keep;
+end;
+
+--------------------------------------------------------------------------------
+-- shot anchors
+-- A shot follows smoothed "anchor" points rather than raw unit centroids, which
+-- jiggle as formations reshape in melee.
+--------------------------------------------------------------------------------
+
+local function make_anchor(x, y, z) return { x = x, y = y, z = z } end;
+
+local function follow_anchor(a, x, y, z)
+	local f = k(CFG.anchor_tau);
+	a.x = a.x + (x - a.x) * f;
+	a.y = a.y + (y - a.y) * f;
+	a.z = a.z + (z - a.z) * f;
+end;
+
+-- live centroid + spread of a set of units
+local function centroid(units)
+	local sx, sy, sz, n = 0, 0, 0, 0;
+	local pts = {};
+	for _, c in ipairs(units) do
+		if is_alive(c.u) then
+			local x, y, z = upos(c.u);
+			sx, sy, sz, n = sx + x, sy + y, sz + z, n + 1;
+			pts[#pts + 1] = { x, z };
+		end;
+	end;
+	if n == 0 then return nil end;
+	local cx, cy, cz = sx / n, sy / n, sz / n;
+	local spread = 0;
+	for _, p in ipairs(pts) do spread = math.max(spread, dist2(cx, cz, p[1], p[2])) end;
+	return cx, cy, cz, spread;
+end;
+
+--------------------------------------------------------------------------------
+-- shot types: frame(sh, P, Q, C, t) -> cam x,y,z, target x,y,z
+-- P = primary anchor, Q = partner anchor (may be nil), C = group anchor (clash shots)
+-- sh.fx/fz = reference axis (toward the enemy / direction of travel), changes slowly
+--------------------------------------------------------------------------------
+
+local SHOTS = {};
+
+SHOTS.tracking = {
+	setup = function(sh)
+		sh.side = chance(0.5) and 1 or -1;
+		sh.dist = sh.big and rnd(26, 38) or rnd(18, 28);
+		sh.h = sh.big and rnd(6, 10) or rnd(3.5, 7);
+		sh.dolly = rnd(-1.5, 1.5);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local px, pz = -sh.fz * sh.side, sh.fx * sh.side;
+		local x = P.x + px * sh.dist + sh.fx * sh.dolly * t;
+		local z = P.z + pz * sh.dist + sh.fz * sh.dolly * t;
+		return x, ground(x, z) + sh.h, z, P.x, P.y + sh.look_h, P.z;
+	end,
+};
+
+SHOTS.over_shoulder = {
+	needs_partner = true,
+	setup = function(sh)
+		sh.back = sh.big and rnd(20, 30) or rnd(12, 20);
+		sh.h = sh.big and rnd(7, 11) or rnd(4, 7);
+		sh.off = rnd(-7, 7);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local x = P.x - sh.fx * sh.back - sh.fz * sh.off;
+		local z = P.z - sh.fz * sh.back + sh.fx * sh.off;
+		local tx, tz = P.x + (Q.x - P.x) * 0.7, P.z + (Q.z - P.z) * 0.7;
+		return x, ground(x, z) + sh.h, z, tx, ground(tx, tz) + sh.look_h, tz;
+	end,
+};
+
+SHOTS.heroic = {
+	setup = function(sh)
+		sh.ang = rnd(-0.9, 0.9);
+		sh.dist = sh.big and rnd(16, 24) or rnd(10, 15);
+		sh.h = rnd(1.2, 2.2);
+		sh.look_h = sh.look_h * 1.6;
+	end,
+	frame = function(sh, P, Q, C, t)
+		local ca, sa = math.cos(sh.ang), math.sin(sh.ang);
+		local fx, fz = sh.fx * ca - sh.fz * sa, sh.fx * sa + sh.fz * ca;
+		local x, z = P.x + fx * sh.dist, P.z + fz * sh.dist;
+		return x, ground(x, z) + sh.h, z, P.x, P.y + sh.look_h, P.z;
+	end,
+};
+
+SHOTS.orbit = {
+	setup = function(sh)
+		sh.a0 = math.random() * 2 * math.pi;
+		sh.speed = rnd(0.10, 0.18) * (chance(0.5) and 1 or -1);
+		sh.dist = sh.big and rnd(30, 42) or rnd(24, 34);
+		sh.h = rnd(9, 15);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local a = sh.a0 + sh.speed * t;
+		local x, z = P.x + math.sin(a) * sh.dist, P.z + math.cos(a) * sh.dist;
+		return x, ground(x, z) + sh.h, z, P.x, P.y + sh.look_h, P.z;
+	end,
+};
+
+SHOTS.wide = {
+	setup = function(sh)
+		sh.ang = math.random() * 2 * math.pi;
+		sh.dist = rnd(70, 105);
+		sh.h = rnd(35, 55);
+		sh.drift = rnd(-0.04, 0.04);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local cx, cz = P.x, P.z;
+		if Q then cx, cz = (cx + Q.x) * 0.5, (cz + Q.z) * 0.5 end;
+		local a = sh.ang + sh.drift * t;
+		local x, z = cx + math.sin(a) * sh.dist, cz + math.cos(a) * sh.dist;
+		return x, ground(x, z) + sh.h, z, cx, ground(cx, cz) + 2, cz;
+	end,
+};
+
+-- behind fliers / charging cavalry, looking where they're going
+SHOTS.chase = {
+	follow_velocity = true,
+	setup = function(sh)
+		sh.back = sh.big and rnd(22, 30) or rnd(16, 24);
+		sh.h = sh.flying and rnd(3, 6) or rnd(5, 8);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local x, z = P.x - sh.fx * sh.back, P.z - sh.fz * sh.back;
+		local y = math.max(ground(x, z), P.y) + sh.h;
+		return x, y, z, P.x + sh.fx * 15, P.y + sh.look_h, P.z + sh.fz * 15;
+	end,
+};
+
+-- EVENT: side-on view of the collision point between two units
+SHOTS.impact = {
+	needs_partner = true,
+	setup = function(sh)
+		sh.side = chance(0.5) and 1 or -1;
+		sh.dist = (sh.big or sh.partner_big) and rnd(32, 42) or rnd(24, 34);
+		sh.h = rnd(4, 8);
+		sh.pull = rnd(-6, 6);	-- slightly favour one side of the collision line
+	end,
+	frame = function(sh, P, Q, C, t)
+		local mx, mz = (P.x + Q.x) * 0.5, (P.z + Q.z) * 0.5;
+		local px, pz = -sh.fz * sh.side, sh.fx * sh.side;
+		local x = mx + px * sh.dist - sh.fx * sh.pull;
+		local z = mz + pz * sh.dist - sh.fz * sh.pull;
+		return x, ground(x, z) + sh.h, z, mx, ground(mx, mz) + 2.5, mz;
+	end,
+};
+
+-- EVENT: low, behind and to the side of the charger, looking at the point of impact
+SHOTS.charge_follow = {
+	needs_partner = true,
+	setup = function(sh)
+		sh.back = sh.big and rnd(20, 28) or rnd(14, 22);
+		sh.off = rnd(6, 12) * (chance(0.5) and 1 or -1);
+		sh.h = rnd(2.5, 5);
+	end,
+	frame = function(sh, P, Q, C, t)
+		local x = P.x - sh.fx * sh.back - sh.fz * sh.off;
+		local z = P.z - sh.fz * sh.back + sh.fx * sh.off;
+		local tx, tz = P.x + (Q.x - P.x) * 0.75, P.z + (Q.z - P.z) * 0.75;
+		return x, ground(x, z) + sh.h, z, tx, ground(tx, tz) + sh.look_h, tz;
+	end,
+};
+
+-- EVENT: several collisions close together - side-on to the battle line, wide enough for all
+SHOTS.clash_wide = {
+	needs_group = true,
+	setup = function(sh)
+		sh.side = chance(0.5) and 1 or -1;
+		sh.dolly = rnd(-2, 2);
+		sh.back_ratio = rnd(0.15, 0.4);	-- swing a little behind one side for depth
+	end,
+	frame = function(sh, P, Q, C, t)
+		local spread = sh.spread_s;
+		local dist = clamp(spread * 1.15 + 35, 45, 150);
+		local h = clamp(10 + spread * 0.3, 12, 45);
+		local px, pz = -sh.fz * sh.side, sh.fx * sh.side;
+		local x = C.x + px * dist - sh.fx * dist * sh.back_ratio + sh.fx * sh.dolly * t;
+		local z = C.z + pz * dist - sh.fz * dist * sh.back_ratio + sh.fz * sh.dolly * t;
+		return x, math.max(ground(x, z), ground(C.x, C.z)) + h, z, C.x, ground(C.x, C.z) + 2.5, C.z;
+	end,
+};
+
+--------------------------------------------------------------------------------
+-- shot construction
+--------------------------------------------------------------------------------
+
+local function score(c, list)
+	local s = 1;
+	if c.melee then s = s + 4 end;
+	if c.missile then s = s + 1.5 end;
+	if c.fast then s = s + 1.5 end;
+	if c.general then s = s * 1.8 end;
+	if c.big then s = s * 1.6 end;
+	if c.flying then s = s * 1.25 end;
+	if c.cavalry then s = s * 1.15 end;
+	if c.routing then s = s * 0.3 end;
+	if not c.friendly then s = s * 0.85 end;
+
+	local n = 0;
+	for _, o in ipairs(list) do
+		if o ~= c and o.melee and dist2(c.x, c.z, o.x, o.z) < 50 then n = n + 1 end;
+	end;
+	s = s + 0.6 * math.min(n, 8);
+
+	if cd.shot and cd.shot.c.key == c.key then s = s * 0.3 end;
+	s = s / (1 + 0.5 * (cd.recent[c.key] or 0));
+	return s;
+end;
+
+local function pick_subject(list)
+	local scored = {};
+	for _, c in ipairs(list) do scored[#scored + 1] = { c = c, s = score(c, list) } end;
+	table.sort(scored, function(a, b) return a.s > b.s end);
+	local total, top = 0, math.min(6, #scored);
+	for i = 1, top do total = total + scored[i].s end;
+	local r = math.random() * total;
+	for i = 1, top do
+		r = r - scored[i].s;
+		if r <= 0 then return scored[i].c end;
+	end;
+	return scored[1] and scored[1].c;
+end;
+
+local function weighted_pick(w)
+	local total = 0;
+	for _, v in pairs(w) do total = total + v end;
+	if total <= 0 then return nil end;
+	local r = math.random() * total;
+	for kname, v in pairs(w) do
+		r = r - v;
+		if v > 0 and r <= 0 then return kname end;
+	end;
+	for kname, v in pairs(w) do if v > 0 then return kname end end;
+end;
+
+local function normal_shot_type(c, partner)
+	local w = {
+		tracking = 3,
+		over_shoulder = partner and 3 or 0,
+		heroic = (c.big or c.general) and 3 or 0.7,
+		orbit = 2,
+		wide = c.melee and 1.5 or 0.8,
+		chase = (c.flying or (c.cavalry and c.fast)) and 3 or 0,
+	};
+	if cd.shot and w[cd.shot.type] then w[cd.shot.type] = w[cd.shot.type] * 0.3 end;
+	return weighted_pick(w) or "tracking";
+end;
+
+-- build the shot table common to all shot types
+local function base_shot(type_name, c, partner)
+	local sh = {
+		type = type_name,
+		c = c,
+		partner = partner,
+		big = c.big,
+		partner_big = partner and partner.big,
+		flying = c.flying,
+		elapsed = 0,
+		look_h = c.big and 4 or 1.8,
+		P = make_anchor(c.x, c.y, c.z),
+		Q = partner and make_anchor(partner.x, partner.y, partner.z) or nil,
+	};
+	if partner then
+		sh.fx, sh.fz = norm2(partner.x - c.x, partner.z - c.z);
+	elseif c.speed and c.speed > 1 then
+		sh.fx, sh.fz = norm2(c.vx, c.vz);
+	else
+		local b = safe(function() return d_to_r(c.u:bearing()) end, 0);
+		sh.fx, sh.fz = math.sin(b), math.cos(b);
+	end;
+	return sh;
+end;
+
+local apply_camera;
+
+local function start_shot(sh)
+	SHOTS[sh.type].setup(sh);
+	cd.shot = sh;
+	cd.recent[sh.c.key] = (cd.recent[sh.c.key] or 0) + 1;
+	log(string.format("shot %-13s %s men=%d general=%s big=%s melee=%s friendly=%s dur=%.1f",
+		sh.type, sh.event and "EVENT" or "     ", sh.c.men, tostring(sh.c.general), tostring(sh.c.big),
+		tostring(sh.c.melee), tostring(sh.c.friendly), sh.duration));
+	apply_camera(sh, true);
+end;
+
+local function new_normal_shot()
+	local list = cd.list;
+	if #list == 0 then return false end;
+	local c = pick_subject(list);
+	if not c then return false end;
+	local partner = nearest_enemy(c, list, 90);
+	local sh = base_shot(normal_shot_type(c, partner), c, partner);
+	sh.duration = rnd(CFG.shot_min, CFG.shot_max);
+	start_shot(sh);
+	return true;
+end;
+
+local function new_event_shot()
+	table.sort(cd.events, function(a, b) return a.score > b.score end);
+	local best = cd.events[1];
+
+	-- gather every pending event near the best one
+	local group, rest = {}, {};
+	for _, e in ipairs(cd.events) do
+		if dist2(best.x, best.z, e.x, e.z) <= CFG.cluster_radius then
+			group[#group + 1] = e;
+		else
+			rest[#rest + 1] = e;
+		end;
+	end;
+	cd.events = rest;
+
+	local sh;
+	if #group >= 2 then
+		local units, seen = {}, {};
+		local ax, az = 0, 0;
+		for _, e in ipairs(group) do
+			for _, c in ipairs({ e.a, e.b }) do
+				if not seen[c.key] then seen[c.key] = true; units[#units + 1] = c end;
+			end;
+			-- align every event's axis the same way before averaging
+			local dx, dz = norm2(e.b.x - e.a.x, e.b.z - e.a.z);
+			if e.a.alliance ~= best.a.alliance then dx, dz = -dx, -dz end;
+			ax, az = ax + dx, az + dz;
+		end;
+		sh = base_shot("clash_wide", best.a, best.b);
+		sh.fx, sh.fz = norm2(ax, az);
+		sh.group = units;
+		local cx, cy, cz, spread = centroid(units);
+		sh.C = make_anchor(cx, cy, cz);
+		sh.spread_s = spread;
+		sh.duration = rnd(5.5, 7.5);
+	else
+		local kind = best.kind;
+		local t;
+		if kind == "charge" then
+			t = weighted_pick({ impact = 3, charge_follow = 2 });
+		else
+			t = weighted_pick({ impact = 3, over_shoulder = 1, heroic = (best.a.big or best.a.general) and 1 or 0 });
+		end;
+		sh = base_shot(t, best.a, best.b);
+		if kind == "charge" then
+			sh.duration = clamp(best.ttc + 3.5, 4, 7);
+		else
+			sh.duration = rnd(4, 5.5);
+		end;
+	end;
+	sh.event = true;
+	log(string.format("  -> filming %d event(s) together", #group));
+	start_shot(sh);
+end;
+
+--------------------------------------------------------------------------------
+-- camera driving
+--------------------------------------------------------------------------------
+
+-- push the camera up if terrain blocks the line to the target
+local function clear_line(x, y, z, tx, ty, tz)
+	local min_c = CFG.min_ground_clearance;
+	local need = ground(x, z) + min_c - y;
+	for _, f in ipairs({ 0.2, 0.4, 0.6, 0.8 }) do
+		local sx, sz = x + (tx - x) * f, z + (tz - z) * f;
+		local line_y = y + (ty - y) * f;
+		local deficit = ground(sx, sz) + min_c - line_y;
+		if deficit > 0 then need = math.max(need, deficit / (1 - f)) end;
+	end;
+	if need > 0 then y = y + need end;
+	return y;
+end;
+
+-- update anchors from live unit positions; returns false if the shot can't continue
+local function update_anchors(sh, snap)
+	if not is_alive(sh.c.u) then return false end;
+	local x, y, z = upos(sh.c.u);
+	if snap then sh.P = make_anchor(x, y, z) else follow_anchor(sh.P, x, y, z) end;
+
+	if sh.partner then
+		if is_alive(sh.partner.u) then
+			local qx, qy, qz = upos(sh.partner.u);
+			if snap or not sh.Q then sh.Q = make_anchor(qx, qy, qz) else follow_anchor(sh.Q, qx, qy, qz) end;
+		elseif SHOTS[sh.type].needs_partner then
+			return false;
+		end;
+	end;
+
+	if sh.group then
+		local cx, cy, cz, spread = centroid(sh.group);
+		if not cx then return false end;
+		if snap then
+			sh.C = make_anchor(cx, cy, cz);
+			sh.spread_s = spread;
+		else
+			follow_anchor(sh.C, cx, cy, cz);
+			sh.spread_s = sh.spread_s + (spread - sh.spread_s) * k(1.5);
+		end;
+	end;
+
+	-- let the reference axis drift slowly toward the live situation
+	local tx, tz;
+	if SHOTS[sh.type].follow_velocity then
+		local vel = cd.vel[sh.c.key];
+		if vel and (vel.vx * vel.vx + vel.vz * vel.vz) > 1 then tx, tz = norm2(vel.vx, vel.vz) end;
+	elseif sh.Q and not sh.group then
+		tx, tz = norm2(sh.Q.x - sh.P.x, sh.Q.z - sh.P.z);
+	end;
+	if tx and not snap then
+		local b = CFG.axis_blend;
+		sh.fx, sh.fz = norm2(sh.fx * (1 - b) + tx * b, sh.fz * (1 - b) + tz * b);
+	end;
+	return true;
+end;
+
+apply_camera = function(sh, cut)
+	if not update_anchors(sh, cut) then return false end;
+
+	local x, y, z, tx, ty, tz = SHOTS[sh.type].frame(sh, sh.P, sh.Q, sh.C, sh.elapsed);
+	y = clear_line(x, y, z, tx, ty, tz);
+
+	local s = cd.cam;
+	if cut or not s then
+		s = { x = x, y = y, z = z, tx = tx, ty = ty, tz = tz };
+		cd.cam = s;
+		bm:camera():move_to(v(x, y, z), v(tx, ty, tz), 0, false, 0);
+		return true;
+	end;
+
+	local kp, kt = k(CFG.cam_pos_tau), k(CFG.cam_targ_tau);
+	local ky = (y > s.y) and k(CFG.cam_rise_tau) or kp;
+	s.x = s.x + (x - s.x) * kp;
+	s.y = s.y + (y - s.y) * ky;
+	s.z = s.z + (z - s.z) * kp;
+	s.tx = s.tx + (tx - s.tx) * kt;
+	s.ty = s.ty + (ty - s.ty) * kt;
+	s.tz = s.tz + (tz - s.tz) * kt;
+
+	-- never let smoothing drag the camera into the ground
+	local gmin = ground(s.x, s.z) + CFG.min_ground_clearance;
+	if s.y < gmin then s.y = gmin end;
+
+	bm:camera():move_to(v(s.x, s.y, s.z), v(s.tx, s.ty, s.tz), CFG.tick_ms / 1000 * CFG.move_dur_factor, false, 0);
+	return true;
+end;
+
+local function tick()
+	if not cd.active then return end;
+	local dt = CFG.tick_ms / 1000;
+	cd.now = cd.now + dt;
+	cd.ticks = cd.ticks + 1;
+
+	if cd.ticks % CFG.survey_every == 1 or #cd.list == 0 then
+		cd.list = survey();
+		detect_events(cd.list);
+	end;
+
+	local sh = cd.shot;
+	if sh then sh.elapsed = sh.elapsed + dt end;
+
+	-- contact events take priority
+	-- late events right next to an ongoing clash shot join it instead of cutting away
+	if sh and sh.event and #cd.events > 0 then
+		local cx, cz = sh.P.x, sh.P.z;
+		if sh.C then cx, cz = sh.C.x, sh.C.z elseif sh.Q then cx, cz = (sh.P.x + sh.Q.x) * 0.5, (sh.P.z + sh.Q.z) * 0.5 end;
+		local rest, widen = {}, false;
+		for _, e in ipairs(cd.events) do
+			if dist2(cx, cz, e.x, e.z) <= CFG.cluster_radius then
+				if not sh.group and sh.partner then
+					-- a single collision just became several: re-cut wide to cover them all
+					widen = true;
+					rest[#rest + 1] = e;
+				elseif sh.group then
+					local have = {};
+					for _, c in ipairs(sh.group) do have[c.key] = true end;
+					if not have[e.a.key] then sh.group[#sh.group + 1] = e.a end;
+					if not have[e.b.key] then sh.group[#sh.group + 1] = e.b end;
+					sh.duration = math.max(sh.duration, sh.elapsed + 3);
+					log("  -> joined ongoing clash shot");
+				end;
+			else
+				rest[#rest + 1] = e;
+			end;
+		end;
+		cd.events = rest;
+		if widen then
+			local c, q = sh.c, sh.partner;
+			table.insert(cd.events, 1, {
+				kind = "contact", a = c, b = q, t = cd.now - 10, ttc = 0,
+				x = (sh.P.x + sh.Q.x) * 0.5, z = (sh.P.z + sh.Q.z) * 0.5, score = 100,
+			});
+			log("  -> widening to cover neighbouring collisions");
+			new_event_shot();
+			return;
+		end;
+	end;
+
+	local events_ready = false;
+	for _, e in ipairs(cd.events) do
+		if cd.now - e.t >= CFG.event_gather or (e.kind == "charge" and e.ttc - (cd.now - e.t) <= CFG.event_urgent_ttc) then
+			events_ready = true;
+		end;
+	end;
+
+	if events_ready then
+		local can_cut = not sh
+			or (not sh.event and sh.elapsed >= CFG.event_interrupt_after)
+			or (sh.event and sh.elapsed >= CFG.event_min_hold);
+		if can_cut then
+			new_event_shot();
+			return;
+		end;
+	end;
+
+	local need_new = not sh or sh.elapsed >= sh.duration;
+	if sh and not need_new and sh.elapsed > 2 and not sh.event
+		and safe(function() return sh.c.u:is_routing() end, false) then
+		need_new = true;
+	end;
+
+	if need_new or not apply_camera(sh, false) then
+		new_normal_shot();
+	end;
+end;
+
+local function safe_tick()
+	local ok, err = pcall(tick);
+	if not ok then
+		cd.errors = cd.errors + 1;
+		log("ERROR in tick: " .. tostring(err));
+		if cd.errors > 20 then
+			log("too many errors, disabling director");
+			cd.active = false;
+			bm:remove_real_callback("cinematic_director_tick");
+		end;
+	end;
+end;
+
+local function set_active(on)
+	if on == cd.active then return end;
+	cd.active = on;
+	if on then
+		log("director ON");
+		cd.shot, cd.cam, cd.list, cd.events = nil, nil, {}, {};
+		cd.hist, cd.prev, cd.vel = {}, {}, {};
+		cd.errors = 0;
+		if CFG.deselect_on_start then pcall(function() bm:clear_selection() end) end;
+		bm:repeat_real_callback(safe_tick, CFG.tick_ms, "cinematic_director_tick");
+		safe_tick();
+	else
+		log("director OFF");
+		bm:remove_real_callback("cinematic_director_tick");
+		cd.shot, cd.cam = nil, nil;
+	end;
+end;
+
+--------------------------------------------------------------------------------
+-- hotkey
+--------------------------------------------------------------------------------
+
+local function on_shortcut(context, event_name)
+	local name = context.string;
+	if cd.shortcuts_logged < CFG.log_shortcuts then
+		cd.shortcuts_logged = cd.shortcuts_logged + 1;
+		log(event_name .. ": " .. tostring(name));
+	end;
+	if not CFG.toggle_shortcuts[name] then return end;
+
+	-- debounce: some keys raise both ShortcutPressed and ShortcutTriggered
+	if cd.toggle_lock then return end;
+	cd.toggle_lock = true;
+	core:get_tm():real_callback(function() cd.toggle_lock = false end, 300);
+
+	set_active(not cd.active);
+end;
+
+core:add_listener("cinematic_director_shortcut_pressed", "ShortcutPressed", true,
+	function(context) on_shortcut(context, "ShortcutPressed") end, true);
+core:add_listener("cinematic_director_shortcut_triggered", "ShortcutTriggered", true,
+	function(context) on_shortcut(context, "ShortcutTriggered") end, true);
+
+core:add_listener("cinematic_director_end", "BattleConflictFinished", true,
+	function() set_active(false) end, true);
+
+math.randomseed(os.time and os.time() or 1);
+log("---- cinematic_director v2 loaded ----");
