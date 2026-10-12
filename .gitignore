@@ -20,3 +20,4 @@ tools/harness/*.txt
 
 # Showcase video renders (large; uploaded separately)
 showcase/
+builds/old_name_installed/
