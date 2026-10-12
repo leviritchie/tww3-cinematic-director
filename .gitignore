@@ -14,3 +14,9 @@ tools/harness/cinematic_director_tactics.txt
 __pycache__/
 *.pyc
 .claude/
+tools/harness/cinematic_director_spells.txt
+tools/harness/*.txt
+!tools/harness/*.lua
+
+# Showcase video renders (large; uploaded separately)
+showcase/

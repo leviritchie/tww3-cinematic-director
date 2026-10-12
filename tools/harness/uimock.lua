@@ -4,7 +4,7 @@ local all = {}
 M.all = all
 local Comp = {} Comp.__index = Comp
 local DEF = { cd_panel={400,300,"default"}, cd_card={300,60,"default"}, cd_fill={100,2,"line"}, cd_label={200,24,"body"},
-  cd_arrow={24,24,"default"}, cd_button={160,32,"active"}, cd_row={260,28,"active"}, txt={160,32,"body_c"}, root={1920,1080,"x"}, other={300,200,"x"} }
+  cd_arrow={24,24,"default"}, cd_icon={32,32,"eye"}, cd_button={160,32,"active"}, cd_row={260,28,"active"}, txt={160,32,"body_c"}, root={1920,1080,"x"}, other={300,200,"x"} }
 local function new(id, tpl, parent)
   local d = DEF[tpl] or DEF.other
   local c = setmetatable({id=id, tpl=tpl, parent=parent, children={}, dock=0, ox=0, oy=0, w=d[1], h=d[2], st=d[3], texts={}, vis=true, inter=true, prio=0}, Comp)
@@ -24,11 +24,13 @@ function Comp:SetStateText(t) self.texts[self.st] = t end
 function Comp:GetStateText() return self.texts[self.st] or "" end
 function Comp:SetVisible(v) self.vis = v end
 function Comp:Visible() return self.vis end
+function Comp:VisibleFromRoot() return self:shown() end
 function Comp:Bounds() return self.w, self.h end
 function Comp:Id() return self.id end
 function Comp:SetInteractive(v) self.inter = v end
 function Comp:SetTooltipText(t) self.tip = t end
 function Comp:PropagatePriority(p) self.prio = p end
+function Comp:Priority() return self.prio end
 function Comp:MoveTo(x, y) self.dock = -1; self.ax, self.ay = x, y end
 function Comp:Position() return self:abs() end
 function Comp:abs()
@@ -39,6 +41,10 @@ function Comp:abs()
   if self.dock == 5 then return px + (pw - self.w) / 2 + self.ox, py + (ph - self.h) / 2 + self.oy end
   return px + self.ox, py + self.oy
 end
+function Comp:Parent() return rawget(self, "parent") end
+function Comp:ChildCount() return #self.children end
+function Comp:Find(i) if type(i) == "number" then return self.children[i + 1] end for _, k in ipairs(self.children) do if k.id == i then return k end end end
+function Comp:GetContextObjectId(t) return rawget(self, "ctx") end
 function Comp:shown() local c = self while c do if not c.vis then return false end c = rawget(c, "parent") end return true end
 setmetatable(Comp, {__index = function() return function() end end})
 
@@ -54,9 +60,20 @@ local STY = {
   caps_gold={11,"E0BE72","left",false,true}, body_c={14,"E9E1CC","center"}, dim_c={13,"8F8879","center"}, gold_c={14,"E0BE72","center"},
   big_c={16,"E0BE72","center",true}, small_r={12,"8F8879","right"}, gold_r={12,"E0BE72","right"}, warn={13,"E08A6A","left"}, para={14,"E9E1CC","left",false,false,true}, para_dim={13,"8F8879","left",false,false,true},
   hud_name={20,"FFF6DE","center",true}, hud_c={15,"E9E1CC","center"}, hud_dim_c={13,"B8B0A0","center"}, feed={14,"E9E1CC","left"}, feed_good={14,"E0BE72","left"},
-  feed_bad={14,"E8846A","left"}, feed_old={13,"8F8879","left"}, tide_l={12,"9CC0EC","left",false,true}, tide_r={12,"E8846A","right",false,true}, caps_c={11,"E0BE72","center",false,true} }
-local FILL = { line="7A644080", gold="D4B26AFF", active="D4B26A30", shade="00000070", clear="00000000", red="B0483AFF", green="6FA05AFF", blue="4F86C6FF", black="000000FF", dark="0E0F12C8" }
+  feed_bad={14,"E8846A","left"}, feed_old={13,"8F8879","left"}, tide_l={12,"9CC0EC","left",false,true}, tide_r={12,"E8846A","right",false,true}, caps_c={11,"E0BE72","center",false,true},
+  banner={17,"FFF6DE","center"}, toast={13,"D8D0BC","center"} }
+local FILL = { line="7A644080", gold="D4B26AFF", active="D4B26A30", shade="00000070", clear="00000000", red="B0483AFF", green="6FA05AFF", blue="4F86C6FF", black="000000FF", dark="0E0F12C8", green_bg="24461CD8", red_bg="561A12D8" }
 local fonts = {}
+local ICONS = {}
+local TINT = { good="8FB8EAFF", bad="EC8A72FF", gold="E0BE72FF", dim="8F8879A0" }
+local function icon_img(name)
+  if ICONS[name] == nil then
+    ICONS[name] = false
+    local f = io.open(MODDIR .. "ui/skins/default/cinematic_director/i_" .. name .. ".png", "rb")
+    if f then local d = f:read("*a") f:close() ICONS[name] = love.graphics.newImage(love.filesystem.newFileData(d, name .. ".png")) end
+  end
+  return ICONS[name]
+end
 local function font(n, bold) local k = n .. (bold and "b" or "") if not fonts[k] then fonts[k] = love.graphics.newFont(n) end return fonts[k] end
 local function box(x, y, w, h, fill, line)
   love.graphics.setColor(fill) love.graphics.rectangle("fill", x, y, w, h)
@@ -76,6 +93,11 @@ function M.draw()
       elseif c.tpl == "cd_button" then local b = BTN[c.st] or BTN.active box(x, y, c.w, c.h, hex(b[1]), hex(b[2]))
       elseif c.tpl == "cd_row" then box(x, y, c.w, c.h, hex(WASH[c.st] or "00000000"))
         if c.st:find("selected") then box(x, y, 3, c.h, hex("D4B26A")) elseif c.st == "hover" then box(x, y, 3, c.h, hex("D4B26A70")) end
+      elseif c.tpl == "cd_icon" then
+        local base, suf = c.st:match("^([%w]+)_?(%w*)$")
+        local img = icon_img(base or c.st)
+        if img then love.graphics.setColor(hex(TINT[suf] or "F2EAD6FF")) love.graphics.draw(img, x, y, 0, c.w / img:getWidth(), c.h / img:getHeight())
+        else box(x, y, c.w, c.h, hex("FF00FFFF")) end
       elseif c.tpl == "other" then box(x, y, c.w, c.h, hex("303848", .8), hex("8090A0")) love.graphics.setColor(1,1,1) love.graphics.print(c.id, x + 6, y + 6)
       end
       local t = c.texts[c.st]

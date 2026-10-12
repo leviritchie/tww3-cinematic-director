@@ -42,17 +42,26 @@ end;
 K.log = log;
 
 --------------------------------------------------------------------------------
--- storage: cqi -> "c,t,a;c,t,a"
+-- storage: cqi -> "c,t,a;c,t,a" for paradigm I, "<cqi>p<k>" for paradigms II-IV
+-- (a paradigm with no entry of its own copies paradigm I)
 --------------------------------------------------------------------------------
 
 local store = {};
+
+local function skey(cqi, p) return (p and p > 1) and (cqi .. "p" .. p) or cqi end;
 
 local function load_store()
 	store = {};
 	local s = safe(function() return cm:get_saved_value(SAVE_KEY) end, nil);
 	if type(s) == "string" then
-		for cqi, tac in s:gmatch("(%d+)=([^|]*)|") do store[cqi] = tac end;
+		for k, tac in s:gmatch("(%w+)=([^|]*)|") do store[k] = tac end;
 	end;
+end;
+
+-- does the unit have tactics of its own in any paradigm?
+local function has_custom(cqi)
+	for p = 1, T.MAX_PARADIGMS do if store[skey(cqi, p)] then return true end end;
+	return false;
 end;
 
 local function save_store()
@@ -111,22 +120,28 @@ local function unit_info(u, char_rank)
 	};
 end;
 
--- the unit's tactics, padded/trimmed to its slot count; third value: using defaults
-local function tactics_for(info)
-	local n = T.slots_for_rank(info.rank);
-	local list = store[info.cqi] and T.parse(store[info.cqi]) or nil;
-	if not list or #list == 0 then return T.default_tactics(info.role, n), n, true end;
-	local out = {};
-	for i = 1, math.min(n, #list) do out[i] = list[i] end;
-	-- pad (rank went up since the tactics were set) with defaults not already listed
-	for _, d in ipairs(T.DEFAULTS[info.role] or T.DEFAULTS.melee) do
-		if #out >= n then break end;
-		local dup = false;
-		for _, t in ipairs(out) do if T.serialise({ t }) == T.serialise({ d }) then dup = true end end;
-		if not dup then T.insert_padded(out, { d[1], d[2], d[3] }) end;
+-- the unit's tactics in paradigm p (default I), padded/trimmed to its slot count (lords and heroes
+-- get every slot); third value: using defaults; fourth: paradigm p has no set of its own (copies I)
+local function tactics_for(info, p)
+	p = p or 1;
+	local n = T.slots_for_rank(info.rank, info.role);
+	if p > 1 and not store[skey(info.cqi, p)] then
+		local list, _, def = tactics_for(info, 1);
+		return list, n, def, true;
 	end;
+	local s = store[skey(info.cqi, p)];
+	local list = s and T.parse(s) or nil;
+	if not list or #list == 0 then return T.default_tactics(info.role, n), n, true, false end;
+	-- pads with defaults when the rank went up since the tactics were set
+	local out = T.fit(list, n, info.role);
 	while #out < n do out[#out + 1] = { "always", "nearest_enemy", "attack" } end;
-	return out, n, false;
+	return out, n, false, false;
+end;
+
+-- the army general's character rank (unlocks paradigms)
+local function general_rank(mf)
+	local general = mf and safe(function() return mf:general_character() end, nil);
+	return general and safe(function() return general:rank() end, nil) or 1;
 end;
 
 --------------------------------------------------------------------------------
@@ -143,13 +158,19 @@ local function export()
 	local n_units = 0;
 	for i = 0, forces:num_items() - 1 do
 		local mf = forces:item_at(i);
-		f:write("force " .. tostring(safe(function() return mf:command_queue_index() end, -1)) .. "\n");
+		f:write("force " .. tostring(safe(function() return mf:command_queue_index() end, -1)) .. " " .. tostring(general_rank(mf)) .. "\n");
 		local ranks = character_ranks(mf);
 		local units = mf:unit_list();
 		for j = 0, units:num_items() - 1 do
 			local info = unit_info(units:item_at(j), ranks[j]);
 			local list = tactics_for(info);
 			f:write(string.format("unit %d %s %s %d %s %s\n", j + 1, info.key, info.cqi, info.rank, info.role, T.serialise(list)));
+			-- paradigms II-IV only where the unit has a set of its own
+			for p = 2, T.MAX_PARADIGMS do
+				if store[skey(info.cqi, p)] then
+					f:write(string.format("para %d %d %s\n", j + 1, p, T.serialise((tactics_for(info, p)))));
+				end;
+			end;
 			n_units = n_units + 1;
 		end;
 	end;
@@ -191,6 +212,8 @@ local ui = {
 	list = nil,			-- its tactics
 	slots = 0,
 	is_default = true,
+	inherits = false,	-- the paradigm being edited copies paradigm I
+	para = 1,			-- paradigm being edited
 	built = false,
 	focus = { kind = "c", row = 1 },	-- the cell the browser is editing ("preset" = whole unit)
 	cat = nil,			-- category shown in the browser (nil = the one holding the current choice)
@@ -229,7 +252,7 @@ end;
 
 local function store_current()
 	if not ui.unit or not ui.list then return end;
-	store[ui.unit.cqi] = T.serialise(ui.list);
+	store[skey(ui.unit.cqi, ui.para)] = T.serialise(ui.list);
 	save_store();
 end;
 
@@ -294,7 +317,11 @@ local function build()
 	end;
 
 	-- unit header
-	lbl("cd_tac_name", "title", L.rx, 84, L.rw - 200, 30, "");
+	lbl("cd_tac_name", "title", L.rx, 84, L.rw - 230, 30, "");
+	-- paradigm tabs I-IV
+	for p = 1, T.MAX_PARADIGMS do
+		btn("cd_tac_p_" .. p, L.rx + L.rw - (T.MAX_PARADIGMS - p + 1) * 54, 84, 48, 30, T.PARADIGM_NAMES[p]);
+	end;
 	lbl("cd_tac_sub", "dim", L.rx, 116, L.rw, 20, "");
 	lbl("cd_tac_cap_n", "caps", L.rx + L.col.n[1], 146, L.col.n[2], 18, "#");
 	lbl("cd_tac_cap_c", "caps", L.rx + L.col.c[1] + 10, 146, 200, 18, "When");
@@ -355,7 +382,12 @@ local function preset_rows(p) return T.take(p[4], ui.slots) end;
 local function choices(kind, row)
 	local t = ui.list and ui.list[row];
 	if kind == "c" and t then return T.categories(T.CONDITIONS, 3), t[1] end;
-	if kind == "a" and t then return T.categories(T.ACTIONS, 4), t[3] end;
+	if kind == "a" and t then
+		local cats = T.categories(T.ACTIONS, 4);
+		-- lords and heroes: the spells this character showed in battle
+		if ui.unit and ui.unit.role == "hero" then cats[#cats + 1] = { "Own spells", T.spell_entries(ui.unit.cqi) } end;
+		return cats, t[3];
+	end;
 	if kind == "t" and t then
 		local need = T.ACTION_BY[t[3]].kind;
 		if need == "-" then return {}, nil end;
@@ -472,6 +504,8 @@ local function draw_browser(warnings)
 	local h = ui.hover and group[ui.hover];
 	if h then
 		desc = h[2] .. ":  " .. choice_help(f.kind, h);
+	elseif cats[j] and cats[j][1] == "Own spells" and #group == 0 then
+		desc = "This character's own spells appear here after their first battle with this mod. Until then use 'Cast attack spell on' or 'Cast helpful spell on' from Spells.";
 	elseif ui.note then
 		desc = ui.note;
 	elseif f.kind == "t" and #cats == 0 then
@@ -498,7 +532,18 @@ local function draw()
 	if not ui.unit_index or ui.unit_index >= #units then ui.unit_index = 0 end;
 	local info = units[ui.unit_index + 1];
 	ui.unit = info;
-	ui.list, ui.slots, ui.is_default = tactics_for(info);
+	ui.list, ui.slots, ui.is_default, ui.inherits = tactics_for(info, ui.para);
+	local gr = general_rank(mf);
+	local avail = T.paradigms_for_rank(gr);
+	for p = 1, T.MAX_PARADIGMS do
+		local b = C("cd_tac_p_" .. p);
+		local own = p == 1 or store[skey(info.cqi, p)] ~= nil;
+		K.state(b, p == ui.para and "selected" or "active");
+		K.text(b, T.PARADIGM_NAMES[p], p == ui.para and "gold_c" or ((p <= avail and own) and "body_c" or "dim_c"));
+		K.tip(b, string.format("Paradigm %s%s. In battle, buttons I-IV switch the whole army between paradigms.%s", T.PARADIGM_NAMES[p],
+			p == 1 and ": the army's opening tactics" or (own and "" or ": same as I until you change a row"),
+			p > avail and string.format(" Unlocks with a general of rank %d in the battle (this one is rank %d).", T.PARADIGM_RANKS[p], gr) or ""));
+	end;
 	if ui.focus.kind ~= "preset" and ui.focus.row > ui.slots then set_focus("c", 1) end;
 
 	local P = C("cd_tac_panel");
@@ -516,10 +561,11 @@ local function draw()
 		local r, rr = C("cd_tac_u_" .. j), C("cd_tac_ur_" .. j);
 		local u = units[j];
 		if u then
-			local custom = store[u.cqi] ~= nil;
+			local custom = has_custom(u.cqi);
+			local ns = T.slots_for_rank(u.rank, u.role);
 			K.text(r, K.unit_name(u.key), (j - 1 == ui.unit_index) and "bright" or "body");
 			K.state(r, (j - 1 == ui.unit_index) and "selected" or "active");
-			K.text(rr, string.format("%s%d slot%s", custom and "custom | " or "", T.slots_for_rank(u.rank), T.slots_for_rank(u.rank) == 1 and "" or "s"),
+			K.text(rr, string.format("%s%d slot%s", custom and "custom | " or "", ns, ns == 1 and "" or "s"),
 				custom and "gold_r" or "small_r");
 			K.tip(r, string.format("%s  |  %s  |  %s", ROLE_NAME[u.role] or u.role,
 				u.char_rank and ("character rank " .. u.char_rank) or ("rank " .. u.rank), custom and "custom tactics" or "default tactics"));
@@ -532,10 +578,12 @@ local function draw()
 	-- unit header
 	K.text(C("cd_tac_name"), K.unit_name(info.key));
 	local rank_txt = info.char_rank and string.format("Character rank %d", info.char_rank) or string.format("Rank %d", info.rank);
-	local next_txt = ui.slots < T.MAX_SLOTS and ("  |  next slot at " .. (info.char_rank and ("character rank " .. T.rank_for_slot(ui.slots + 1) * 3)
+	local next_txt = (ui.slots < T.MAX_SLOTS and info.role ~= "hero") and ("  |  next slot at " .. (info.char_rank and ("character rank " .. T.rank_for_slot(ui.slots + 1) * 3)
 		or ("rank " .. T.rank_for_slot(ui.slots + 1)))) or "";
+	local state_txt = ui.inherits and ("paradigm " .. T.PARADIGM_NAMES[ui.para] .. " same as I - change a row to give it its own")
+		or (ui.is_default and "default tactics" or "custom tactics");
 	K.text(C("cd_tac_sub"), string.format("%s  |  %s  |  %d of %d tactic slots%s  |  %s", ROLE_NAME[info.role] or info.role, rank_txt,
-		ui.slots, T.MAX_SLOTS, next_txt, ui.is_default and "default tactics" or "custom tactics"));
+		ui.slots, T.MAX_SLOTS, next_txt, state_txt));
 
 	-- rows
 	local unreach = T.unreachable(ui.list);
@@ -591,8 +639,11 @@ local function draw()
 	K.text(preset, pname and ("Preset: " .. pname) or "Presets...", f.kind == "preset" and "gold_c" or "body_c");
 	K.state(preset, f.kind == "preset" and "selected" or "active");
 	local reset = C("cd_tac_reset");
-	K.state(reset, ui.is_default and "inactive" or "active");
-	K.text(reset, nil, ui.is_default and "dim_c" or "body_c");
+	local can_reset = store[skey(info.cqi, ui.para)] ~= nil;
+	K.state(reset, can_reset and "active" or "inactive");
+	K.text(reset, ui.para > 1 and "Same as paradigm I" or "Reset to default", can_reset and "body_c" or "dim_c");
+	K.tip(reset, ui.para > 1 and "Drop this paradigm's own tactics: it copies paradigm I again."
+		or "Go back to the default tactics for this kind of unit.");
 
 	draw_browser(warnings);
 end;
@@ -692,14 +743,24 @@ local function on_click(id)
 		return true;
 	end;
 
+	local p = id:match("^cd_tac_p_(%d)$");
+	if p then
+		ui.para = tonumber(p);
+		ui.hover, ui.note = nil, nil;
+		draw();
+		return true;
+	end;
+
 	if id == "cd_tac_reset" then
-		if store[ui.unit.cqi] then
-			store[ui.unit.cqi] = nil;
+		local key = skey(ui.unit.cqi, ui.para);
+		if store[key] then
+			store[key] = nil;
 			save_store();
-			log("unit " .. ui.unit.cqi .. " reset to defaults");
+			log("unit " .. ui.unit.cqi .. " paradigm " .. ui.para .. " reset");
 		end;
 		set_focus("c", 1);
-		ui.note = "Back to the default tactics for this kind of unit.";
+		ui.note = ui.para > 1 and ("Paradigm " .. T.PARADIGM_NAMES[ui.para] .. " copies paradigm I again.")
+			or "Back to the default tactics for this kind of unit.";
 		draw();
 		return true;
 	end;
@@ -716,7 +777,7 @@ local function on_click(id)
 			for j2 = 0, units:num_items() - 1 do
 				local un = units:item_at(j2);
 				if un:unit_key() == ui.unit.key then
-					store[tostring(un:command_queue_index())] = T.serialise(ui.list);
+					store[skey(tostring(un:command_queue_index()), ui.para)] = T.serialise(ui.list);
 					n = n + 1;
 				end;
 			end;
@@ -817,4 +878,4 @@ cm:add_first_tick_callback(function()
 end);
 
 -- debug hook for the harness
-CD_TAC_EDITOR = { ui = ui, draw = draw, click = on_click, hover = on_hover };
+CD_TAC_EDITOR = { ui = ui, draw = draw, click = on_click, hover = on_hover, export = export, store = function() return store end };

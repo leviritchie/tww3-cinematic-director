@@ -1,10 +1,14 @@
 --------------------------------------------------------------------------------
 -- Cinematic Director: tactics catalogue (shared by campaign editor and battle engine)
 --
--- A tactic is { cond, target, action }. Each unit has 2 + floor(rank / 2) tactic
--- slots (1-5). In battle a unit walks its tactics top to bottom and follows the
--- first one whose condition holds and whose target exists; if none apply it
--- falls back to its role's default behaviour.
+-- A tactic is { cond, target, action }. Regiments have 2 + floor(rank / 2) tactic
+-- slots (2-5); lords and heroes always have all 5. In battle a unit walks its
+-- tactics top to bottom and follows the first one whose condition holds and whose
+-- target exists; if none apply it attacks the nearest enemy.
+-- "Plays" are whole battle plans in one row (skirmish, cycle charge, hammer and
+-- anvil, ...): the engine runs a small state machine for each.
+-- Spell rows ("cast_attack", "cast_buff", "sp_<ability key>") run alongside the
+-- movement rows.
 --------------------------------------------------------------------------------
 
 CD_TACTICS = {};
@@ -12,9 +16,25 @@ local T = CD_TACTICS;
 
 T.MAX_SLOTS = 5;
 
-function T.slots_for_rank(rank)
+-- role "hero" (lords and heroes): all slots, their spellcasting needs the room
+function T.slots_for_rank(rank, role)
+	if role == "hero" then return T.MAX_SLOTS end;
 	rank = tonumber(rank) or 0;
 	return math.min(T.MAX_SLOTS, 2 + math.floor(rank / 2));
+end;
+
+-- Paradigms: up to four whole-army tactics sets, switched with buttons in battle. Each unit has
+-- one row list per paradigm; paradigms 2-4 copy paradigm 1 until edited. How many the player can
+-- use depends on the highest character rank among the player's living generals in the battle.
+T.MAX_PARADIGMS = 4;
+T.PARADIGM_RANKS = { 1, 5, 12, 20 };		-- general's rank that unlocks paradigm k
+T.PARADIGM_NAMES = { "I", "II", "III", "IV" };
+
+function T.paradigms_for_rank(rank)
+	rank = tonumber(rank) or 1;
+	local n = 1;
+	for k, r in ipairs(T.PARADIGM_RANKS) do if rank >= r then n = k end end;
+	return n;
 end;
 
 -- Every list entry is { id, label, ... , category }. The editor groups entries by
@@ -60,6 +80,14 @@ T.CONDITIONS = {
 	{ "lord_near",          "Our lord within 80 m",                "Allies" },
 	{ "lord_far",           "Our lord over 150 m away",            "Allies" },
 
+	{ "self_winning",       "Self winning its fight",              "Fights" },
+	{ "self_winning_big",   "Self winning easily",                 "Fights" },
+	{ "self_losing",        "Self losing its fight",               "Fights" },
+	{ "self_losing_bad",    "Self losing badly",                   "Fights" },
+	{ "ally_winning",       "Ally within 150 m winning",           "Fights" },
+	{ "ally_losing",        "Ally within 150 m losing",            "Fights" },
+	{ "ally_losing_bad",    "Ally within 150 m losing badly",      "Fights" },
+
 	{ "winning",            "Our army is stronger",                "Battle" },
 	{ "even",               "Armies about even",                   "Battle" },
 	{ "losing",             "Our army is weaker",                  "Battle" },
@@ -91,6 +119,8 @@ T.TARGETS = {
 	{ "enemy_attacking_lord","Enemy fighting our lord",      "e", "Enemy: state" },
 	{ "enemy_weakest",       "Weakest enemy",                "e", "Enemy: state" },
 	{ "enemy_strongest",     "Strongest enemy",              "e", "Enemy: state" },
+	{ "enemy_winning_fight", "Enemy beating one of ours",    "e", "Enemy: state" },
+	{ "enemy_losing_fight",  "Enemy losing its fight",       "e", "Enemy: state" },
 
 	{ "ally_lord",           "Our lord",                     "a", "Allies" },
 	{ "ally_engaged",        "Ally in melee",                "a", "Allies" },
@@ -98,17 +128,34 @@ T.TARGETS = {
 	{ "ally_nearest",        "Nearest ally",                 "a", "Allies" },
 	{ "ally_missile",        "Our missile units",            "a", "Allies" },
 	{ "ally_large",          "Our nearest hero/monster",     "a", "Allies" },
+	{ "ally_losing_fight",   "Ally losing its fight",        "a", "Allies" },
+
+	{ "trigger_enemy",       "Enemy from WHEN",              "e", "From the condition" },
+	{ "trigger_ally",        "Ally from WHEN",               "a", "From the condition" },
 
 	{ "self",                "Self",                         "-", "Self" },
 };
 
--- actions: what the unit does { id, label, need, category }; need = target kind the action requires
+-- actions: what the unit does { id, label, need, category, passes }; need = target kind the action
+-- requires; passes = the action can decline (no fitting target right now), handing over to the next row
 T.ACTIONS = {
+	{ "hammer",      "Hammer and anvil",           "-", "Plays" },
+	{ "hammer_flank","Hammer: flank charge",       "-", "Plays" },
+	{ "hammer_wide", "Hammer: wide sweep",         "-", "Plays" },
+	{ "cycle_charge","Cycle charge",               "e", "Plays", true },
+	{ "skirmish",    "Skirmish (shoot and back off)",  "e", "Plays" },
+	{ "focus",       "Focus fire",                 "-", "Plays", true },
+	{ "fire_support","Fire support",               "e", "Plays" },
+	{ "disrupt",     "Hunt missiles",              "-", "Plays", true },
+	{ "kill_lord",   "Kill the general",           "-", "Plays", true },
+	{ "high_ground", "Take the high ground",       "-", "Plays" },
+	{ "duelist",     "Duel",                       "e", "Plays", true },
+	{ "caster",      "Battle mage",                "-", "Plays" },
+
 	{ "attack",      "Attack",                     "e", "Fight" },
 	{ "charge",      "Charge (all out)",           "e", "Fight" },
 	{ "melee",       "Melee attack",               "e", "Fight" },
 	{ "flank",       "Flank and attack",           "e", "Fight" },
-	{ "skirmish",    "Shoot and keep distance",    "e", "Fight" },
 	{ "approach",    "Advance toward",             "e", "Fight" },
 
 	{ "guard",       "Guard",                      "a", "Support" },
@@ -121,7 +168,7 @@ T.ACTIONS = {
 	{ "regroup",     "Regroup with the army",      "-", "Position" },
 
 	{ "cast_attack", "Cast attack spell on",       "e", "Spells" },
-	{ "cast_buff",   "Cast buff/heal on",          "a", "Spells" },
+	{ "cast_buff",   "Cast helpful spell on",          "a", "Spells" },
 };
 
 local function index(list, kind_field, cat_field)
@@ -134,6 +181,85 @@ end;
 T.COND_BY = index(T.CONDITIONS, nil, 3);
 T.TARGET_BY = index(T.TARGETS, 3, 4);
 T.ACTION_BY = index(T.ACTIONS, 3, 4);
+for _, e in ipairs(T.ACTIONS) do T.ACTION_BY[e[1]].passes = e[5] or false end;
+
+--------------------------------------------------------------------------------
+-- a hero's own spells: action id "sp_<ability key>". The battle engine finds out which
+-- abilities a character has and writes them to cinematic_director_spells.txt; the
+-- campaign editor offers them from there. CD_ABILITIES (key lists by category) is shared.
+--------------------------------------------------------------------------------
+
+T.SPELLS_PATH = "cinematic_director_spells.txt";
+local BUFF_CAT = { A = true, R = true };
+local spell_cat_of;
+
+function T.spell_cat(key)
+	if not spell_cat_of then
+		if type(CD_ABILITIES) ~= "table" then return nil end;
+		spell_cat_of = {};
+		for cat, list in pairs(CD_ABILITIES) do
+			for _, k in ipairs(list) do spell_cat_of[k] = cat end;
+		end;
+	end;
+	return spell_cat_of[key];
+end;
+
+-- "wh_main_spell_heavens_wind_blast_upgraded" -> "Wind Blast (upgraded)" when the game has no name for it
+local function pretty_key(key)
+	local s = key:gsub("^wh%d?_[%w]+_", "");
+	s = s:gsub("^.-abilities_", ""):gsub("^spell_", "");
+	local up = s:find("_upgraded$") ~= nil;
+	s = s:gsub("_upgraded$", ""):gsub("_", " ");
+	s = s:gsub("^%l", string.upper);
+	return s .. (up and " (upgraded)" or "");
+end;
+
+function T.spell_name(key)
+	local n;
+	pcall(function() n = common.get_localised_string("unit_abilities_onscreen_name_" .. key) end);
+	if type(n) == "string" and n ~= "" then return n end;
+	return pretty_key(key);
+end;
+
+function T.is_spell_id(id) return type(id) == "string" and id:sub(1, 3) == "sp_" end;
+
+setmetatable(T.ACTION_BY, { __index = function(t, id)
+	if not T.is_spell_id(id) then return nil end;
+	local key = id:sub(4);
+	if key == "" or not key:match("^[%w_]+$") then return nil end;
+	local cat = T.spell_cat(key);
+	local e = { id = id, label = "Cast " .. T.spell_name(key), kind = BUFF_CAT[cat] and "a" or "e", cat = "Own spells",
+		spell = key, scat = cat, passes = false };
+	rawset(t, id, e);
+	return e;
+end });
+
+-- the spells the battle engine has seen this unit (unit cqi) use: list of ability keys
+function T.known_spells(cqi)
+	local out = {};
+	local ok, f = pcall(io.open, T.SPELLS_PATH, "r");
+	if not ok or not f then return out end;
+	pcall(function()
+		for line in f:lines() do
+			local c, rest = line:match("^spells (%S+) ?(.*)$");
+			if c and c == tostring(cqi) then
+				for k in rest:gmatch("[%w_]+") do out[#out + 1] = k end;
+			end;
+		end;
+	end);
+	f:close();
+	return out;
+end;
+
+-- editor entries for a unit's own spells { id, label, need, category }
+function T.spell_entries(cqi)
+	local out = {};
+	for _, k in ipairs(T.known_spells(cqi)) do
+		local a = T.ACTION_BY["sp_" .. k];
+		if a then out[#out + 1] = { a.id, a.label, a.kind, "Own spells" } end;
+	end;
+	return out;
+end;
 
 -- categories of a list in order of first appearance: { { name, { entries } }, ... }
 function T.categories(list, cat_field, filter)
@@ -172,65 +298,77 @@ function T.role_from_class(class, men, general, ammo, cav, fly)
 end;
 
 -- default tactics per role, most important first; a unit with n slots gets the first n
+-- (the first two are what a fresh recruit does, so they carry a whole plan)
 T.DEFAULTS = {
 	melee = {
 		{ "always",         "nearest_enemy", "attack" },
 		{ "enemy_cav_near", "enemy_cavalry", "attack" },
-		{ "ally_in_melee",  "enemy_engaged", "attack" },
-		{ "hp_lt_25",       "self",          "retreat" },
 		{ "lord_in_melee",  "ally_lord",     "guard" },
+		{ "hp_lt_25",       "self",          "retreat" },
+		{ "ally_in_melee",  "enemy_engaged", "attack" },
 	},
 	missile = {
-		{ "always",         "nearest_enemy", "attack" },
-		{ "enemy_near",     "self",          "retreat" },
-		{ "always",         "enemy_free",    "attack" },
-		{ "always",         "enemy_large",   "attack" },
-		{ "hp_lt_25",       "self",          "retreat" },
+		{ "always",         "self",          "focus" },
+		{ "hp_lt_25",       "self",          "to_lord" },
+		{ "always",         "nearest_enemy", "skirmish" },
+		{ "enemy_cav_near", "enemy_cavalry", "skirmish" },
+		{ "few_enemies",    "enemy_weakest", "attack" },
 	},
 	missile_cav = {
-		{ "always",         "nearest_enemy", "attack" },
-		{ "enemy_near",     "self",          "retreat" },
-		{ "always",         "enemy_free",    "attack" },
-		{ "always",         "enemy_missile", "attack" },
-		{ "hp_lt_25",       "self",          "retreat" },
+		{ "always",         "enemy_missile", "skirmish" },
+		{ "always",         "nearest_enemy", "skirmish" },
+		{ "hp_lt_25",       "self",          "regroup" },
+		{ "always",         "self",          "kill_lord" },
+		{ "always",         "self",          "hammer" },
 	},
 	cavalry = {
-		{ "always",         "enemy_missile", "charge" },
-		{ "ally_in_melee",  "enemy_engaged", "charge" },
-		{ "always",         "nearest_enemy", "attack" },
-		{ "early",          "ally_lord",     "guard" },
-		{ "hp_lt_25",       "self",          "retreat" },
+		{ "always",         "self",          "disrupt" },
+		{ "always",         "self",          "hammer" },
+		{ "hp_lt_25",       "self",          "regroup" },
+		{ "always",         "self",          "kill_lord" },
+		{ "enemy_cav_near", "enemy_cavalry", "cycle_charge" },
 	},
 	monster = {
-		{ "always",         "nearest_enemy", "attack" },
-		{ "always",         "enemy_infantry","attack" },
-		{ "ally_in_melee",  "enemy_engaged", "attack" },
-		{ "hp_lt_25",       "self",          "retreat" },
-		{ "always",         "enemy_missile", "attack" },
+		{ "always",         "self",          "hammer" },
+		{ "enemy_large_near","enemy_large",  "attack" },
+		{ "hp_lt_25",       "self",          "regroup" },
+		{ "always",         "self",          "kill_lord" },
+		{ "always",         "self",          "disrupt" },
 	},
 	hero = {
-		{ "always",         "nearest_enemy", "attack" },
-		{ "always",         "enemy_engaged", "cast_attack" },
-		{ "always",         "ally_engaged",  "cast_buff" },
-		{ "hp_lt_50",       "self",          "retreat" },
-		{ "always",         "enemy_large",   "attack" },
+		{ "always",         "enemy_large",   "duelist" },
+		{ "always",         "self",          "caster" },
+		{ "hp_lt_25",       "self",          "to_lord" },
+		{ "always",         "self",          "kill_lord" },
+		{ "always",         "ally_weakest",  "cast_buff" },
 	},
 };
 
--- default list for a unit with n slots: first n entries, conditional ones ahead of "always"
--- so earlier rules aren't shadowed (a tactic with "Always" and a target that exists always fires)
-function T.default_tactics(role, n)
-	local src = T.DEFAULTS[role] or T.DEFAULTS.melee;
+-- sort order for a taken list: conditional rows first, then "Always" rows that can hand over
+-- to the next row (plays that decline), then the rest; otherwise keep the source order
+local function row_rank(t)
+	if t[1] ~= "always" then return 0 end;
+	local a = T.ACTION_BY[t[3]];
+	if T.is_cast(t[3]) or (a and a.passes) then return 1 end;
+	if t[2] ~= "nearest_enemy" and t[2] ~= "self" then return 1 end;
+	return 2;
+end;
+
+local function take(src, n)
 	local out = {};
 	for i = 1, math.min(n, #src) do out[#out + 1] = { src[i][1], src[i][2], src[i][3], order = i } end;
 	table.sort(out, function(a, b)
-		local ca, cb = a[1] ~= "always", b[1] ~= "always";
-		if ca ~= cb then return ca end;
+		local ra, rb = row_rank(a), row_rank(b);
+		if ra ~= rb then return ra < rb end;
 		return a.order < b.order;
 	end);
 	for _, t in ipairs(out) do t.order = nil end;
 	return out;
 end;
+
+-- default list for a unit with n slots: first n entries, conditional ones ahead of "always"
+-- so earlier rules aren't shadowed (a tactic with "Always" and a target that exists always fires)
+function T.default_tactics(role, n) return take(T.DEFAULTS[role] or T.DEFAULTS.melee, n) end;
 
 -- is the combination usable? returns false and a reason if not
 function T.validate(t)
@@ -261,184 +399,304 @@ end;
 
 function T.label(t)
 	local c, tg, a = T.COND_BY[t[1]], T.TARGET_BY[t[2]], T.ACTION_BY[t[3]];
+	if a and a.kind == "-" then return (c and c.label or t[1]) .. " | " .. a.label end;
 	return (c and c.label or t[1]) .. " | " .. (a and a.label or t[3]) .. " " .. (tg and tg.label or t[2]);
 end;
 
 -- plain-language help shown in the editor
 T.HELP = {
-	always = "Always applies. Rows below an 'Always' row are only reached when its target doesn't exist.",
-	early = "Only during the first minute after deployment ends - e.g. hold the line, then advance.",
-	after_60 = "From one minute into the battle onward.",
-	after_180 = "From three minutes into the battle onward - a late push or a late retreat.",
-	in_melee = "This unit is fighting in melee.",
-	not_in_melee = "This unit is not fighting in melee.",
+	always = "Always true. Rows below are used only when this row's target doesn't exist.",
+	early = "The first minute after deployment.",
+	after_60 = "From one minute into the battle.",
+	after_180 = "From three minutes into the battle.",
+	in_melee = "This unit is in melee.",
+	not_in_melee = "This unit is not in melee.",
 	under_fire = "This unit is being hit by missiles.",
 	not_under_fire = "No missiles are hitting this unit.",
-	hp_gt_75 = "This unit is still fresh: more than three quarters of its health left.",
-	hp_lt_75 = "This unit has lost more than a quarter of its health.",
-	hp_lt_50 = "This unit has lost more than half its health.",
-	hp_lt_25 = "This unit has lost more than three quarters of its health.",
-	has_ammo = "This unit still has ammunition (never true for units without missiles).",
-	ammo_low = "This unit has used more than three quarters of its ammunition.",
-	ammo_out = "This missile unit has no ammunition left.",
-	isolated = "No friendly unit within 100 m - this unit is on its own.",
-	enemy_near_40 = "An enemy unit is within 40 m - about to make contact.",
-	enemy_near = "Any enemy unit within 80 m of this unit. A unit falling back because of this keeps going until 130 m clear.",
-	enemy_near_150 = "Any enemy unit within 150 m of this unit.",
-	no_enemy_near = "No enemy unit within 150 m of this unit.",
-	enemies_near_3 = "Three or more enemy units within 120 m - this unit is about to be swarmed.",
+	hp_gt_75 = "This unit has more than 75% health.",
+	hp_lt_75 = "This unit has less than 75% health.",
+	hp_lt_50 = "This unit has less than 50% health.",
+	hp_lt_25 = "This unit has less than 25% health.",
+	has_ammo = "This unit has ammunition left.",
+	ammo_low = "This unit has less than 25% ammunition.",
+	ammo_out = "This missile unit has no ammunition.",
+	isolated = "No friendly unit within 100 m.",
+	enemy_near_40 = "An enemy within 40 m.",
+	enemy_near = "An enemy within 80 m (a unit falling back on this keeps going to 130 m).",
+	enemy_near_150 = "An enemy within 150 m.",
+	no_enemy_near = "No enemy within 150 m.",
+	enemies_near_3 = "Three or more enemies within 120 m.",
 	enemy_cav_near = "Enemy cavalry, chariots or flyers within 120 m.",
 	enemy_large_near = "An enemy monster, hero or lord within 120 m.",
 	enemy_missile_near = "Enemy archers, gunners or artillery within 200 m.",
 	enemy_inf_near = "Enemy infantry within 80 m.",
-	enemy_general_near = "The enemy general is within 150 m.",
-	ally_in_melee = "A friendly unit within 150 m is fighting in melee.",
-	ally_hurt_near = "A friendly unit within 150 m has lost more than half its health.",
-	missiles_threatened = "An enemy unit is within 60 m of one of your missile units.",
-	lord_in_melee = "Your lord is fighting in melee.",
-	lord_hurt = "Your lord has lost more than half his health.",
-	lord_near = "Your lord is within 80 m of this unit.",
-	lord_far = "Your lord is more than 150 m away from this unit.",
-	winning = "Your army's remaining strength is clearly greater than the enemy's.",
+	enemy_general_near = "The enemy general within 150 m.",
+	ally_in_melee = "A friendly unit within 150 m is in melee.",
+	ally_hurt_near = "A friendly unit within 150 m has less than 50% health.",
+	missiles_threatened = "An enemy within 60 m of one of your missile units.",
+	lord_in_melee = "Your lord is in melee.",
+	lord_hurt = "Your lord has less than 50% health.",
+	lord_near = "Your lord is within 80 m.",
+	lord_far = "Your lord is more than 150 m away.",
+	self_winning = "This unit is in melee and the enemies it is fighting are losing health at least 1.5 times as fast as it is (over the last few seconds).",
+	self_winning_big = "This unit is in melee and the enemies it is fighting are losing health at least 2.5 times as fast as it is, or one of them is wavering.",
+	self_losing = "This unit is in melee and losing health at least 1.5 times as fast as the enemies it is fighting (over the last few seconds).",
+	self_losing_bad = "This unit is in melee and losing health at least 2.5 times as fast as the enemies it is fighting, or it is wavering.",
+	ally_winning = "A friendly unit within 150 m is winning its fight (see Self winning its fight).",
+	ally_losing = "A friendly unit within 150 m is losing its fight (see Self losing its fight).",
+	ally_losing_bad = "A friendly unit within 150 m is losing its fight badly (see Self losing badly).",
+	winning = "Your army is clearly stronger.",
 	even = "Neither army is clearly stronger.",
-	losing = "Your army's remaining strength is clearly smaller than the enemy's.",
-	outnumbered = "The enemy has more units still fighting than you do.",
-	few_enemies = "Only three or fewer enemy units are still fighting - time to mop up.",
+	losing = "Your army is clearly weaker.",
+	outnumbered = "The enemy has more units fighting.",
+	few_enemies = "Three or fewer enemy units still fighting.",
 
-	nearest_enemy = "The closest enemy unit (always exists while enemies remain).",
-	enemy_near_lord = "The enemy unit closest to your lord - keep him safe.",
-	enemy_near_missiles = "The enemy unit closest to any of your missile units - protect your shooters.",
-	enemy_isolated = "The enemy unit farthest from its own allies - easy prey.",
-	enemy_farthest = "The enemy unit farthest from this unit - deep strikes for fast units.",
-	enemy_infantry = "The closest enemy infantry regiment.",
+	nearest_enemy = "The closest enemy.",
+	enemy_near_lord = "The enemy closest to your lord.",
+	enemy_near_missiles = "The enemy closest to your missile units.",
+	enemy_isolated = "The enemy farthest from its allies.",
+	enemy_farthest = "The enemy farthest from this unit.",
+	enemy_infantry = "The closest enemy infantry.",
 	enemy_missile = "The closest enemy archers, gunners or artillery.",
-	enemy_archers = "The closest enemy archers or gunners (not artillery).",
-	enemy_artillery = "The closest enemy artillery piece or war machine.",
+	enemy_archers = "The closest enemy archers or gunners.",
+	enemy_artillery = "The closest enemy artillery or war machine.",
 	enemy_cavalry = "The closest enemy cavalry, chariot or flyer.",
-	enemy_flier = "The closest enemy unit that can fly.",
+	enemy_flier = "The closest enemy flyer.",
 	enemy_large = "The closest enemy monster, hero or lord.",
-	enemy_monster = "The closest enemy monster (not a hero or lord).",
-	enemy_hero = "The closest enemy hero (a single character that is not the general).",
+	enemy_monster = "The closest enemy monster.",
+	enemy_hero = "The closest enemy hero.",
 	enemy_general = "The enemy general.",
-	enemy_engaged = "The closest enemy that is in melee with one of your units - good for flanking.",
-	enemy_free = "The closest enemy that is not yet fighting.",
-	enemy_attacking_lord = "An enemy unit fighting in melee next to your lord.",
-	enemy_weakest = "The most damaged enemy unit (nearer ones preferred).",
-	enemy_strongest = "The healthiest enemy unit (nearer ones preferred).",
+	enemy_engaged = "The closest enemy in melee with your units.",
+	enemy_free = "The closest enemy not in melee.",
+	enemy_attacking_lord = "An enemy in melee next to your lord.",
+	enemy_weakest = "The most damaged enemy (nearer ones first).",
+	enemy_strongest = "The healthiest enemy (nearer ones first).",
+	enemy_winning_fight = "The closest enemy in melee that is beating the unit it is fighting (losing health at most two thirds as fast).",
+	enemy_losing_fight = "The closest enemy in melee that is losing its fight (losing health at least 1.5 times as fast as your units fighting it).",
 	ally_lord = "Your lord.",
-	ally_engaged = "The closest friendly unit that is fighting in melee.",
+	ally_engaged = "The closest friendly unit in melee.",
 	ally_weakest = "The most damaged friendly unit.",
 	ally_nearest = "The closest friendly unit.",
 	ally_missile = "Your closest missile unit.",
 	ally_large = "Your closest hero or monster (not the lord).",
-	self = "This unit itself.",
+	ally_losing_fight = "The closest friendly unit that is losing its fight.",
+	trigger_enemy = "The enemy the row's WHEN condition found, the closest one: for example the enemy within 80 m, the enemy this unit or an ally is fighting, the enemy near your lord or your missile units, or the closest enemy shooter when under fire. If the condition is about no enemy, the row is skipped.",
+	trigger_ally = "The friendly unit the row's WHEN condition found, the closest one: for example the ally losing its fight, the hurt ally, the ally in melee, your missile unit with an enemy near, or your lord. If the condition is about no friendly unit, the row is skipped.",
+	self = "This unit.",
 
-	attack = "Advance and fight the target. Missile units shoot it from range.",
-	charge = "Run at the target and fight it hand to hand - best for cavalry and shock troops.",
-	melee = "Fight the target hand to hand, even if this unit could shoot.",
-	flank = "Swing round to the target's side and rear first, then attack it from there.",
-	skirmish = "Shoot the target but back away whenever it gets within 70 m. Melee units just attack.",
-	approach = "Move to about 60 m from the target and wait there without attacking - screening, baiting or getting into range.",
-	cast_attack = "Cast a damaging spell or ability on the target. Spell rows are checked separately from movement rows, so the unit can move and cast.",
-	guard = "Stay close to the friendly target and fight anything that comes near it.",
-	follow = "Move next to the friendly target without stopping to fight.",
-	cover = "Stand between the friendly target and the nearest enemy, blocking its path.",
-	cast_buff = "Cast a buff, ward or heal on the friendly target (heals only on damaged units).",
-	hold = "Stay where the unit is and defend that spot.",
-	retreat = "Pull back away from the enemy (toward your lord if he is safely behind).",
-	to_lord = "Pull back to your lord's side.",
-	regroup = "Move back to the middle of your army.",
+	hammer = "Wait beside your army. When your other units have been fighting an enemy for 3 s, go round it the shortest clear way and charge it from behind. Cavalry and monsters then pull back and charge again; mounted missile units shoot instead. After a minute of waiting, attack the nearest enemy.",
+	hammer_flank = "Like Hammer and anvil, but charges as soon as it reaches the enemy's side.",
+	hammer_wide = "Like Hammer and anvil, but stays 45 m farther away while going round.",
+	cycle_charge = "Charge, fight for a set time (cavalry 9 s, chariots 3 s, monsters 14 s), pull back 70 m toward your army, line up, charge again. Stays in the fight if the enemy is below 35% health. Passes to the next row below 30% health.",
+	skirmish = "Shoot the target. Move back toward your army when enemy melee troops come within 75 m, unless they are already fighting. Out of ammunition: join the nearest fight.",
+	focus = "All units on Focus fire shoot the same enemy: lords, heroes, monsters and artillery first, damaged ones first. Move away from enemy melee troops. Out of ammunition: join the nearest fight.",
+	fire_support = "Stay 20-40 m behind the nearest friendly melee unit and shoot the target. Fall back behind it if enemy melee troops come within 45 m. Out of ammunition: join the fight.",
+	disrupt = "Attack enemy archers, gunners and artillery, one of your units per target, going round enemy troops in the way. Passes to the next row when none are left.",
+	kill_lord = "Attack the enemy general when at most one enemy unit is near him, he is in melee, or he is below 50% health. Passes to the next row otherwise, or below 30% health (60% for your general).",
+	high_ground = "Move to the highest point within 120 m, not toward the enemy, and stay there. Fight enemies that come close; shoot those in range.",
+	duelist = "Fight the target in melee when a friendly unit is near it, it is in melee, or it is alone. Passes to the next row otherwise, or below 40% health (60% for your general).",
+	caster = "Stay 50 m behind the nearest friendly unit that is fighting, move away from enemies, and cast damaging and helpful spells. A hero with no spells does Hammer and anvil instead.",
+	attack = "Attack the target. Missile units shoot.",
+	charge = "Attack the target in melee at a run.",
+	melee = "Attack the target in melee, even if this unit can shoot.",
+	flank = "Move to the target's side, then attack it.",
+	approach = "Move to 60 m from the target and stop.",
+	cast_attack = "Cast a damaging spell on the target. Spell rows run alongside movement rows.",
+	guard = "Stay next to the friendly target and attack enemies that come near it.",
+	follow = "Move next to the friendly target without fighting.",
+	cover = "Stand between the friendly target and the nearest enemy.",
+	cast_buff = "Cast a helpful spell on the friendly target (healing only on damaged units).",
+	hold = "Stay in place and defend.",
+	retreat = "Move away from the enemy (toward your lord if he is behind).",
+	to_lord = "Move to your lord.",
+	regroup = "Move to the middle of your army.",
 };
 
-function T.help(id) return T.HELP[id] or "" end;
+function T.help(id)
+	if T.is_spell_id(id) then
+		local a = T.ACTION_BY[id];
+		return "Cast this spell when it is ready and the condition holds. Spell rows run alongside movement rows."
+			.. (a and a.kind == "a" and " Needs a friendly target." or " Needs an enemy target.");
+	end;
+	return T.HELP[id] or "";
+end;
 
 -- the rank at which slot k unlocks (slots = 2 + floor(rank / 2): two from the start)
 function T.rank_for_slot(k) return math.max(0, (k - 2) * 2) end;
 
 -- a padded conditional row goes above the first "always" row, or it could never fire;
 -- a padded "always" row goes last, as a fallback behind the player's own rows
+-- a padded row that could never fire (an earlier "Always" row takes every case) is left out
 function T.insert_padded(list, t)
-	if t[1] == "always" then list[#list + 1] = t; return end;
-	for i, r in ipairs(list) do
-		if r[1] == "always" then table.insert(list, i, t); return end;
+	local at = #list + 1;
+	if t[1] ~= "always" then
+		for i, r in ipairs(list) do
+			if r[1] == "always" then at = i; break end;
+		end;
 	end;
-	list[#list + 1] = t;
+	table.insert(list, at, t);
+	if T.unreachable(list)[at] then table.remove(list, at); return false end;
+	return true;
 end;
 
--- presets: { id, name, description, rows, category }; rows in importance order, a unit with n slots takes the first n
+-- a saved row list fitted to n slots: cut to n, then padded with the role's defaults not already listed
+function T.fit(list, n, role)
+	local out = {};
+	for k = 1, math.min(n, #list) do out[k] = list[k] end;
+	for _, d in ipairs(T.DEFAULTS[role] or T.DEFAULTS.melee) do
+		if #out >= n then break end;
+		local dup = false;
+		for _, t in ipairs(out) do if t[1] == d[1] and t[2] == d[2] and t[3] == d[3] then dup = true end end;
+		if not dup then T.insert_padded(out, { d[1], d[2], d[3] }) end;
+	end;
+	return out;
+end;
+
+-- presets: { id, name, description, rows, category }; rows in importance order, a unit with n slots takes
+-- the first n. Every preset's plan is complete in its first two rows; later rows refine it.
 T.PRESETS = {
-	{ "line",      "Hold the line",  "Hold position for the first minute, then fight whatever is nearest; turn to face cavalry.", {
+	{ "line",      "Hold the line",  "Hold position for the first minute, then attack the nearest enemy. Attack cavalry that comes near.", {
 		{ "always", "nearest_enemy", "attack" }, { "early", "self", "hold" }, { "enemy_cav_near", "enemy_cavalry", "attack" },
 		{ "lord_in_melee", "ally_lord", "guard" }, { "hp_lt_25", "self", "retreat" } }, "Infantry" },
-	{ "vanguard",  "Vanguard",       "Charge straight in and keep pushing; help allies already fighting.", {
+	{ "hill",      "Hold the hill",  "Take and hold the nearest high ground.", {
+		{ "always", "self", "high_ground" }, { "few_enemies", "enemy_weakest", "attack" }, { "lord_in_melee", "enemy_attacking_lord", "attack" },
+		{ "hp_lt_25", "self", "retreat" }, { "enemy_cav_near", "enemy_cavalry", "attack" } }, "Infantry" },
+	{ "inf_flank", "Flanking infantry", "Wait until your other units are fighting, then attack the sides and backs of the enemies they fight.", {
+		{ "always", "self", "hammer" }, { "hp_lt_25", "self", "regroup" }, { "lord_in_melee", "enemy_attacking_lord", "attack" },
+		{ "enemy_cav_near", "enemy_cavalry", "attack" }, { "always", "self", "kill_lord" } }, "Infantry" },
+	{ "vanguard",  "Vanguard",       "Charge the nearest enemy. Help allies in melee.", {
 		{ "always", "nearest_enemy", "charge" }, { "ally_in_melee", "enemy_engaged", "charge" }, { "enemy_cav_near", "enemy_cavalry", "attack" },
 		{ "always", "enemy_large", "attack" }, { "hp_lt_25", "self", "retreat" } }, "Infantry" },
-	{ "bodyguard", "Bodyguard",      "Stick to the lord and fight anything that reaches him.", {
-		{ "always", "ally_lord", "guard" }, { "lord_in_melee", "enemy_engaged", "attack" }, { "enemy_near", "nearest_enemy", "attack" },
+	{ "bodyguard", "Bodyguard",      "Stay with the lord and attack enemies that reach him.", {
+		{ "always", "ally_lord", "guard" }, { "lord_in_melee", "enemy_attacking_lord", "attack" }, { "enemy_near", "nearest_enemy", "attack" },
 		{ "hp_lt_25", "self", "retreat" }, { "always", "nearest_enemy", "attack" } }, "Infantry" },
-	{ "screen",    "Missile screen", "Stand between your missile units and the enemy, and attack anything that reaches them.", {
+	{ "screen",    "Missile screen", "Stand between your missile units and the enemy. Attack enemies that reach them.", {
 		{ "always", "ally_missile", "cover" }, { "missiles_threatened", "enemy_near_missiles", "attack" }, { "enemy_near_40", "nearest_enemy", "attack" },
 		{ "hp_lt_25", "self", "to_lord" }, { "few_enemies", "enemy_weakest", "attack" } }, "Infantry" },
-	{ "flanker",   "Flanker",        "Hit enemies that are already locked in melee with your units.", {
-		{ "always", "nearest_enemy", "attack" }, { "ally_in_melee", "enemy_engaged", "charge" }, { "always", "enemy_missile", "charge" },
-		{ "hp_lt_50", "self", "retreat" }, { "always", "enemy_free", "attack" } }, "Cavalry" },
-	{ "hunter",    "Hunter",         "Ride down archers and artillery, then flank.", {
-		{ "always", "enemy_missile", "charge" }, { "ally_in_melee", "enemy_engaged", "charge" }, { "always", "nearest_enemy", "attack" },
-		{ "hp_lt_50", "self", "retreat" }, { "always", "enemy_free", "attack" } }, "Cavalry" },
-	{ "hammer",    "Hammer and anvil", "Stay with the lord until the lines meet, then swing round and hit the enemies your infantry is fighting.", {
-		{ "always", "nearest_enemy", "attack" }, { "ally_in_melee", "enemy_engaged", "flank" }, { "early", "ally_lord", "follow" },
-		{ "enemy_cav_near", "enemy_cavalry", "charge" }, { "hp_lt_25", "self", "regroup" } }, "Cavalry" },
-	{ "skirmish",  "Skirmisher",     "Shoot from range and back off when enemies close in.", {
-		{ "always", "nearest_enemy", "attack" }, { "enemy_near", "self", "retreat" }, { "always", "enemy_free", "attack" },
-		{ "always", "enemy_large", "attack" }, { "hp_lt_25", "self", "retreat" } }, "Missile" },
-	{ "sniper",    "Monster hunter", "Focus fire on monsters, heroes and lords; keep distance.", {
-		{ "always", "enemy_large", "attack" }, { "enemy_near", "self", "retreat" }, { "always", "nearest_enemy", "attack" },
-		{ "always", "enemy_cavalry", "attack" }, { "hp_lt_25", "self", "retreat" } }, "Missile" },
-	{ "harasser",  "Harasser",       "Pick off enemy shooters while keeping distance; fall back to the lord when hurt, and fight on once out of ammo.", {
+	{ "hammer",    "Hammer and anvil", "Wait beside your army. Go round an enemy your other units are fighting, charge it from behind, pull back, charge again.", {
+		{ "always", "self", "hammer" }, { "hp_lt_25", "self", "regroup" }, { "enemy_cav_near", "enemy_cavalry", "cycle_charge" },
+		{ "always", "self", "kill_lord" }, { "few_enemies", "enemy_weakest", "cycle_charge" } }, "Cavalry" },
+	{ "hunter",    "Missile hunter", "Attack enemy archers and artillery, then charge from behind enemies your other units are fighting.", {
+		{ "always", "self", "disrupt" }, { "always", "self", "hammer" }, { "hp_lt_25", "self", "regroup" },
+		{ "always", "self", "kill_lord" }, { "enemy_cav_near", "enemy_cavalry", "cycle_charge" } }, "Cavalry" },
+	{ "shock",     "Shock cavalry",  "Charge, pull back, charge again.", {
+		{ "always", "enemy_engaged", "cycle_charge" }, { "always", "nearest_enemy", "cycle_charge" }, { "hp_lt_25", "self", "regroup" },
+		{ "always", "self", "kill_lord" }, { "always", "enemy_missile", "cycle_charge" } }, "Cavalry" },
+	{ "assassin",  "Lord hunter",    "Attack the enemy general when he is alone, in melee or badly hurt. Otherwise charge from behind enemies your other units are fighting.", {
+		{ "always", "self", "kill_lord" }, { "always", "self", "hammer" }, { "hp_lt_25", "self", "regroup" },
+		{ "always", "self", "disrupt" }, { "always", "enemy_hero", "duelist" } }, "Cavalry" },
+	{ "focus",     "Focus fire",     "All shooters on this plan shoot the same enemy. Move away from enemy melee troops.", {
+		{ "always", "self", "focus" }, { "hp_lt_25", "self", "to_lord" }, { "enemy_cav_near", "enemy_cavalry", "skirmish" },
+		{ "always", "nearest_enemy", "skirmish" }, { "few_enemies", "enemy_weakest", "attack" } }, "Missile" },
+	{ "skirmish",  "Skirmisher",     "Shoot from range. Move away when enemy melee troops come near.", {
+		{ "always", "nearest_enemy", "skirmish" }, { "hp_lt_25", "self", "to_lord" }, { "always", "enemy_free", "skirmish" },
+		{ "always", "enemy_large", "skirmish" }, { "enemy_cav_near", "enemy_cavalry", "skirmish" } }, "Missile" },
+	{ "support",   "Fire support",   "Shoot from just behind your melee units. Fall back behind them if the enemy gets through.", {
+		{ "always", "enemy_engaged", "fire_support" }, { "always", "nearest_enemy", "fire_support" }, { "hp_lt_25", "self", "to_lord" },
+		{ "always", "enemy_large", "fire_support" }, { "always", "self", "focus" } }, "Missile" },
+	{ "battery",   "Hilltop battery", "Shoot from the highest ground nearby.", {
+		{ "always", "self", "high_ground" }, { "hp_lt_25", "self", "to_lord" }, { "missiles_threatened", "enemy_near_missiles", "attack" },
+		{ "enemy_near_40", "nearest_enemy", "attack" }, { "always", "self", "focus" } }, "Missile" },
+	{ "harasser",  "Harasser",       "Shoot enemy archers and gunners from range, then anything else.", {
 		{ "always", "enemy_archers", "skirmish" }, { "always", "nearest_enemy", "skirmish" }, { "hp_lt_50", "self", "to_lord" },
-		{ "ammo_out", "enemy_engaged", "attack" }, { "enemy_cav_near", "enemy_cavalry", "skirmish" } }, "Missile" },
-	{ "champion",  "Champion",       "Duel monsters and heroes, casting attack spells as you go.", {
-		{ "always", "enemy_large", "attack" }, { "always", "enemy_engaged", "cast_attack" }, { "always", "nearest_enemy", "attack" },
-		{ "hp_lt_25", "self", "retreat" }, { "always", "ally_engaged", "cast_buff" } }, "Lords and heroes" },
-	{ "mage",      "Battle mage",    "Stay near the lord and blast enemies with spells.", {
-		{ "always", "ally_lord", "guard" }, { "always", "enemy_engaged", "cast_attack" }, { "enemy_near", "self", "retreat" },
-		{ "always", "nearest_enemy", "cast_attack" }, { "always", "ally_engaged", "cast_buff" } }, "Lords and heroes" },
-	{ "support",   "Support caster", "Stay back, heal and buff your fighting units.", {
-		{ "always", "ally_lord", "guard" }, { "always", "ally_engaged", "cast_buff" }, { "hp_lt_50", "ally_weakest", "cast_buff" },
-		{ "enemy_near", "self", "retreat" }, { "always", "enemy_engaged", "cast_attack" } }, "Lords and heroes" },
+		{ "always", "self", "kill_lord" }, { "enemy_cav_near", "enemy_cavalry", "skirmish" } }, "Missile" },
+	{ "champion",  "Champion",       "Fight enemy monsters and heroes in melee. Otherwise charge from behind enemies your other units are fighting. Cast spells.", {
+		{ "always", "enemy_large", "duelist" }, { "always", "self", "hammer" }, { "always", "enemy_engaged", "cast_attack" },
+		{ "hp_lt_25", "self", "to_lord" }, { "always", "ally_engaged", "cast_buff" } }, "Lords and heroes" },
+	{ "mage",      "Battle mage",    "Stay behind your fighting units and cast spells.", {
+		{ "always", "self", "caster" }, { "hp_lt_50", "ally_weakest", "cast_buff" }, { "always", "enemy_large", "cast_attack" },
+		{ "lord_hurt", "ally_lord", "cast_buff" }, { "always", "ally_engaged", "cast_buff" } }, "Lords and heroes" },
+	{ "slayer",    "Lord slayer",    "Attack the enemy general when he is alone, in melee or badly hurt. Fight enemy monsters and heroes in melee.", {
+		{ "always", "self", "kill_lord" }, { "always", "enemy_large", "duelist" }, { "hp_lt_25", "self", "to_lord" },
+		{ "always", "self", "hammer" }, { "always", "enemy_engaged", "cast_attack" } }, "Lords and heroes" },
+	{ "commander", "Commander",      "Stay behind your fighting units and cast spells. Fight only enemies within 40 m.", {
+		{ "always", "self", "caster" }, { "enemy_near_40", "nearest_enemy", "attack" }, { "hp_lt_50", "self", "regroup" },
+		{ "always", "ally_engaged", "cast_buff" }, { "always", "enemy_engaged", "cast_attack" } }, "Lords and heroes" },
 };
 T.PRESET_BY = {};
 for i, p in ipairs(T.PRESETS) do T.PRESET_BY[p[1]] = p end;
 
--- first n entries of a list, conditional rows first so "Always" rows don't shadow them
-function T.take(src, n)
-	local out = {};
-	for i = 1, math.min(n, #src) do out[#out + 1] = { src[i][1], src[i][2], src[i][3], order = i } end;
-	table.sort(out, function(a, b)
-		local ca, cb = a[1] ~= "always", b[1] ~= "always";
-		if ca ~= cb then return ca end;
-		return a.order < b.order;
-	end);
-	for _, t in ipairs(out) do t.order = nil end;
-	return out;
-end;
+-- first n entries of a list, ordered so "Always" rows don't shadow the rows below them
+T.take = take;
 
-local function is_cast(a) return a == "cast_attack" or a == "cast_buff" end;
+local function is_cast(a) return a == "cast_attack" or a == "cast_buff" or T.is_spell_id(a) end;
 T.is_cast = is_cast;
 
 -- rows that can never fire because an earlier row of the same kind (movement or spell)
--- always applies: condition "Always" and a target that always exists
+-- always applies: condition "Always", a target that always exists, an action that never declines
 function T.unreachable(list)
 	local out, blocked = {}, { move = false, cast = false };
 	for i, t in ipairs(list) do
 		local kind = is_cast(t[3]) and "cast" or "move";
 		if blocked[kind] then out[i] = blocked[kind] end;
-		if not blocked[kind] and t[1] == "always" and (t[2] == "nearest_enemy" or t[2] == "self") and kind == "move" then
+		local a = T.ACTION_BY[t[3]];
+		if not blocked[kind] and t[1] == "always" and (t[2] == "nearest_enemy" or t[2] == "self") and kind == "move"
+			and not (a and a.passes) then
 			blocked[kind] = i;
 		end;
 	end;
 	return out;
 end;
+
+-- symbols (HUD icon names, see tools/make_ui.py) and what a unit is doing, for the battle panel and the
+-- director's banner. Plays describe their current step (the engine's state().phase).
+T.ACT_ICON = {
+	hammer = "rear", hammer_flank = "flank", hammer_wide = "rear", cycle_charge = "charge", skirmish = "volley", focus = "volley", fire_support = "volley",
+	disrupt = "charge", kill_lord = "general", high_ground = "hold", duelist = "duel", caster = "spell",
+	attack = "clash", charge = "charge", melee = "clash", flank = "flank", approach = "charge",
+	guard = "hold", follow = "hold", cover = "hold", hold = "hold", retreat = "rout", to_lord = "general", regroup = "hold",
+	cast_attack = "spell", cast_buff = "spell",
+};
+local PHASE_ICON = { wait = "hold", swing = "flank", rear = "rear", hit = "rear", flank_hit = "flank", charge = "charge", contact = "clash",
+	out = "charge", reform = "hold", kite = "volley", round = "flank" };
+
+function T.icon(act, phase)
+	if phase and PHASE_ICON[phase] then return PHASE_ICON[phase] end;
+	if T.is_spell_id(act) then return "spell" end;
+	return T.ACT_ICON[act] or "tactic";
+end;
+
+-- %s = the target's name
+local PHASE_TEXT = {
+	wait = "waiting beside the army", swing = "going round %s", rear = "getting behind %s", hit = "hitting %s in the rear", flank_hit = "hitting %s in the flank",
+	charge = "charging %s", contact = "fighting %s", out = "pulling back to charge again", reform = "lining up another charge",
+	kite = "backing off to keep shooting", round = "going round enemy troops to reach %s",
+};
+local ACT_TEXT = {
+	hammer = "hitting %s in the rear", hammer_flank = "hitting %s in the flank", hammer_wide = "hitting %s in the rear", cycle_charge = "charging %s", skirmish = "shooting %s and keeping away", focus = "shooting %s with the others",
+	fire_support = "shooting %s from behind our units", disrupt = "hunting down %s", kill_lord = "going for %s", high_ground = "holding the high ground",
+	duelist = "fighting %s", caster = "casting spells from behind our units",
+	attack = "attacking %s", charge = "charging %s", melee = "fighting %s", flank = "attacking %s from the side", approach = "advancing on %s",
+	guard = "guarding %s", follow = "moving to %s", cover = "standing in front of %s", hold = "holding position", retreat = "falling back",
+	to_lord = "falling back to the general", regroup = "regrouping",
+};
+T.PLAYS = { hammer = true, hammer_flank = true, hammer_wide = true, cycle_charge = true, skirmish = true, focus = true, fire_support = true, disrupt = true,
+	kill_lord = true, high_ground = true, duelist = true, caster = true };
+
+-- "charging Orc Boyz"; who = the target's name (nil: "the enemy")
+function T.doing(act, phase, who)
+	local f = (phase and PHASE_TEXT[phase]) or ACT_TEXT[act];
+	if not f then return nil end;
+	if act == "caster" and phase ~= "kite" then f = ACT_TEXT.caster end;
+	if act == "high_ground" then f = ACT_TEXT.high_ground end;
+	return (f:gsub("%%s", function() return who or "the enemy" end));
+end;
+
+-- very short condition names for the compact battle panel
+T.COND_SHORT = {
+	always = "", early = "First 60 s", after_60 = "After 1 min", after_180 = "After 3 min",
+	in_melee = "In melee", not_in_melee = "Not in melee", under_fire = "Under fire", not_under_fire = "Not under fire",
+	hp_gt_75 = "HP>75%", hp_lt_75 = "HP<75%", hp_lt_50 = "HP<50%", hp_lt_25 = "HP<25%",
+	has_ammo = "Has ammo", ammo_low = "Ammo<25%", ammo_out = "No ammo", isolated = "Alone",
+	enemy_near_40 = "Foe<40 m", enemy_near = "Foe<80 m", enemy_near_150 = "Foe<150 m", no_enemy_near = "No foe near",
+	enemies_near_3 = "3+ foes near", enemy_cav_near = "Cavalry near", enemy_large_near = "Monster near",
+	enemy_missile_near = "Shooters near", enemy_inf_near = "Infantry near", enemy_general_near = "Their general near",
+	ally_in_melee = "Ally fighting", ally_hurt_near = "Ally hurt", missiles_threatened = "Shooters threatened",
+	lord_in_melee = "Lord fighting", lord_hurt = "Lord hurt", lord_near = "Lord near", lord_far = "Lord far",
+	self_winning = "Winning fight", self_winning_big = "Winning easily", self_losing = "Losing fight", self_losing_bad = "Losing badly",
+	ally_winning = "Ally winning", ally_losing = "Ally losing", ally_losing_bad = "Ally losing badly",
+	winning = "Army winning", even = "Armies even", losing = "Army losing", outnumbered = "Outnumbered", few_enemies = "Mop-up",
+};
 
 -- one-line plain description of a row
 function T.sentence(t)

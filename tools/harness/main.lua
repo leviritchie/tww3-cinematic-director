@@ -26,6 +26,21 @@ dofile(MOD.."script/_lib/mod/cinematic_director_ui.lua")
 if SCN == "battle" then
   MODDIR = MOD
   dofile("battle.lua")
+elseif SCN == "hammer" then
+  MODDIR = MOD
+  dofile("hammer.lua")
+elseif SCN == "hunt" then
+  MODDIR = MOD
+  dofile("hunt.lua")
+elseif SCN == "fights" then
+  MODDIR = MOD
+  dofile("fights.lua")
+elseif SCN == "deploy" then
+  MODDIR = MOD
+  dofile("deploy.lua")
+elseif SCN == "plays" then
+  MODDIR = MOD
+  dofile("plays.lua")
 elseif SCN == "campaign" then
   local function list(t) return {num_items=function() return #t end, item_at=function(_,i) return t[i+1] end} end
   local function unit(key,cqi,xp,caste) return {unit_key=function() return key end, command_queue_index=function() return cqi end, experience_level=function() return xp end, unit_caste=function() return caste end} end
@@ -49,7 +64,9 @@ elseif SCN == "campaign" then
   pump() P("button before selection", U.find(root,"cd_tac_open") and U.find(root,"cd_tac_open"):shown())
   -- the game's own selection listener records the army; any script touching the event context fails the run
   cm.campaign_ui_manager.mf_selected_cqi = 77
-  fire("CharacterSelected", setmetatable({}, {__index=function(_,k) error("event context accessed: " .. tostring(k)) end}))
+  -- the pre-pass editor (the build that works in game) reads context:character(); anything else fails the run
+  local ch = {has_military_force=function() return true end, military_force=function() return mf end}
+  fire("CharacterSelected", setmetatable({character=function() return ch end}, {__index=function(_,k) error("event context accessed: " .. tostring(k)) end}))
   pump()
   P("open button", U.find(root,"cd_tac_open"):shown(), U.find(root,"cd_tac_open"):abs())
   click("cd_tac_open")
@@ -58,11 +75,13 @@ elseif SCN == "campaign" then
   P("focus", CD_TAC_EDITOR.ui.focus.kind, CD_TAC_EDITOR.ui.focus.row)
   click("cd_tac_c_2") click("cd_tac_cat_3") hover("cd_tac_opt_2")
   shot(OUT .. "/c2_when_group")
+  click("cd_tac_cat_6") hover("cd_tac_opt_4") shot(OUT .. "/c2b_fights") click("cd_tac_cat_3") hover("cd_tac_opt_2")
   click("cd_tac_opt_2")
   P("after when pick", SAVED.cd_tactics_v1, CD_TAC_EDITOR.ui.focus.kind, CD_TAC_EDITOR.ui.focus.row)
   click("cd_tac_cat_2") click("cd_tac_opt_3")
   P("after do pick", SAVED.cd_tactics_v1, CD_TAC_EDITOR.ui.focus.kind)
   shot(OUT .. "/c3_targets")
+  click("cd_tac_cat_4") hover("cd_tac_opt_1") shot(OUT .. "/c3b_trigger_targets") click("cd_tac_cat_1")
   click("cd_tac_opt_1")
   click("cd_tac_a_1") click("cd_tac_cat_3") click("cd_tac_opt_2")
   P("hold pick", SAVED.cd_tactics_v1, CD_TAC_EDITOR.ui.focus.kind)
@@ -76,6 +95,24 @@ elseif SCN == "campaign" then
   shot(OUT .. "/c6_lord_spells")
   click("cd_tac_up_2") click("cd_tac_x_1") click("cd_tac_reset") click("cd_tac_copy")
   P("saved", SAVED.cd_tactics_v1)
+  -- paradigms: II copies I until edited; edit II, check the export
+  click("cd_tac_u_2") click("cd_tac_p_2")
+  P("para II inherits", CD_TAC_EDITOR.ui.inherits, CD_TAC_EDITOR.ui.para)
+  click("cd_tac_a_1") click("cd_tac_cat_1") click("cd_tac_opt_1")
+  P("para II own", CD_TAC_EDITOR.ui.inherits, SAVED.cd_tactics_v1)
+  click("cd_tac_p_4")
+  shot(OUT .. "/c7_paradigm_iv")
+  click("cd_tac_p_1")
+  -- hero spells: the spells file names hero 18's spells
+  local sf = io.open("cinematic_director_spells.txt", "w") sf:write("spells 18 fireball heal\n") sf:close()
+  CD_ABILITIES = CD_ABILITIES or { D={"fireball"}, R={"heal"} }
+  click("cd_tac_u_8") click("cd_tac_a_1")
+  local cats = {} for k = 1, 7 do local c = U.find(root, "cd_tac_cat_" .. k) cats[#cats+1] = c and (U.find_child(c,"txt") or c):GetStateText() or "" end
+  P("hero action groups", table.concat(cats, " / "))
+  click("cd_tac_cat_6") shot(OUT .. "/c8_own_spells")
+  click("cd_tac_opt_1") P("hero row 1", CD_TAC_EDITOR.ui.list[1][3], #CD_TAC_EDITOR.ui.list)
+  CD_TAC_EDITOR.export()
+  local ef = io.open("cinematic_director_tactics.txt") P("export:\n" .. ef:read("*a")) ef:close()
   click("cd_tac_done") P("panel shown after done", U.find(root,"cd_tac_panel"):shown())
 end
 end, debug.traceback)

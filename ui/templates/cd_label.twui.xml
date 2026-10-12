@@ -459,6 +459,36 @@
 						font_m_colour="#E0BE72FF"
 						font_m_leading="2"/>
 				</caps_c>
+				<banner
+					this="668B59A4-71D5-5BF3-B878B6E7BD45611D"
+					name="banner"
+					width="200"
+					height="24"
+					uniqueguid="668B59A4-71D5-5BF3-B878B6E7BD45611D">
+					<component_text
+						textvalign="Center"
+						texthalign="Center"
+						textlocalised="true"
+						font_m_font_name="la_gioconda"
+						font_m_size="17"
+						font_m_colour="#FFF6DEFF"
+						font_m_leading="2"/>
+				</banner>
+				<toast
+					this="D37E3264-147B-5DF7-B2BEFABF2C0C8F2A"
+					name="toast"
+					width="200"
+					height="24"
+					uniqueguid="D37E3264-147B-5DF7-B2BEFABF2C0C8F2A">
+					<component_text
+						textvalign="Center"
+						texthalign="Center"
+						textlocalised="true"
+						font_m_font_name="la_gioconda"
+						font_m_size="13"
+						font_m_colour="#D8D0BCFF"
+						font_m_leading="2"/>
+				</toast>
 			</states>
 		</cd_label>
 		<root

@@ -185,6 +185,38 @@
 							colour="#0E0F12C8"/>
 					</imagemetrics>
 				</dark>
+				<green_bg
+					this="0DB38E69-D7CA-5785-959BD4B219D171B3"
+					name="green_bg"
+					width="100"
+					height="2"
+					uniqueguid="0DB38E69-D7CA-5785-959BD4B219D171B3">
+					<imagemetrics>
+						<image
+							this="7E0F79AF-6389-5272-926EB1E2520DFA8D"
+							uniqueguid="7E0F79AF-6389-5272-926EB1E2520DFA8D"
+							componentimage="762D8E0E-F603-53D5-B23BD88965F7E648"
+							width="100"
+							height="2"
+							colour="#24461CD8"/>
+					</imagemetrics>
+				</green_bg>
+				<red_bg
+					this="9FE00139-4573-5741-816056DB8C7860BC"
+					name="red_bg"
+					width="100"
+					height="2"
+					uniqueguid="9FE00139-4573-5741-816056DB8C7860BC">
+					<imagemetrics>
+						<image
+							this="24C8A257-FE2D-56A3-AA8F85573C0E3BA3"
+							uniqueguid="24C8A257-FE2D-56A3-AA8F85573C0E3BA3"
+							componentimage="762D8E0E-F603-53D5-B23BD88965F7E648"
+							width="100"
+							height="2"
+							colour="#561A12D8"/>
+					</imagemetrics>
+				</red_bg>
 			</states>
 		</cd_fill>
 		<root
